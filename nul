@@ -1,0 +1,6 @@
+dir: cannot access '/s': No such file or directory
+dir: cannot access '/b': No such file or directory
+dir: cannot access 'C:devfuncode*.toml': No such file or directory
+dir: cannot access 'C:devfuncode*.yaml': No such file or directory
+dir: cannot access 'C:devfuncode*.yml': No such file or directory
+dir: cannot access 'C:devfuncode*.json': No such file or directory

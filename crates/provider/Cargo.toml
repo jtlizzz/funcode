@@ -1,0 +1,10 @@
+[package]
+name = "provider"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+anyhow.workspace = true

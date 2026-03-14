@@ -1,0 +1,62 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/provider",
+    "crates/lsp",
+    "crates/mcp",
+    "crates/tools",
+    "crates/server",
+    "crates/db",
+    "crates/tui",
+    "crates/cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+tokio-stream = "0.1"
+futures = "0.3"
+
+# Web framework
+axum = "0.7"
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "fs"] }
+hyper = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
+reqwest-eventsource = "0.6"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Database
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# LSP
+lsp-types = "0.97"
+
+# CLI/TUI
+clap = { version = "4", features = ["derive"] }
+ratatui = "0.26"
+crossterm = "0.27"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# Error handling
+thiserror = "1"
+anyhow = "1"
+
+# Others
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+async-trait = "0.1"
+parking_lot = "0.12"
+dashmap = "5"
