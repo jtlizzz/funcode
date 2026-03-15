@@ -1,5 +1,6 @@
-pub mod provider;
 pub mod models;
+pub mod provider;
 
-pub use provider::*;
 pub use models::*;
+pub use provider::*;
+
