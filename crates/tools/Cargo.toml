@@ -10,3 +10,6 @@ tokio.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 provider = { path = "../provider" }
+
+[dev-dependencies]
+tempfile.workspace = true
