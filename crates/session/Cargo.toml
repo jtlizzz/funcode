@@ -7,8 +7,11 @@ edition.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+tokio-stream.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
+parking_lot.workspace = true
 provider = { path = "../provider" }
+tools = { path = "../tools" }
