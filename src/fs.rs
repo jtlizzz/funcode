@@ -1,9 +1,8 @@
 //! 文件系统操作模块。
 //!
-//! 提供文件系统抽象，支持文本文件的读写操作。
-//! 默认实现基于本地文件系统（`LocalFs`），可通过 `FileSystem` trait 扩展为其他后端。
+//! 提供异步文件系统操作，基于 tokio 异步运行时。
+//! `LocalFs` 的所有方法均为 async 关联函数，对 tokio::fs 做语义层面的薄封装。
 
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
@@ -39,36 +38,15 @@ pub struct FileEntry {
     pub len: u64,
 }
 
-// ==================== FileSystem trait ====================
+// ==================== LocalFs ====================
 
-/// 文件系统抽象特征。
-///
-/// 提供文本文件读写和目录浏览能力，所有实现必须是线程安全的。
-pub trait FileSystem: Send + Sync {
+/// 基于本地磁盘的异步文件系统操作。
+pub struct FileSystem;
+
+impl FileSystem {
     /// 读取文本文件的全部内容。
-    fn read_file(&self, path: &Path) -> Result<String, FsError>;
-
-    /// 将文本内容写入文件，如果父目录不存在会自动创建。
-    fn write_file(&self, path: &Path, content: &str) -> Result<(), FsError>;
-
-    /// 检查指定路径是否存在。
-    fn exists(&self, path: &Path) -> bool;
-
-    /// 列出目录中的所有条目。
-    fn list_dir(&self, path: &Path) -> Result<Vec<FileEntry>, FsError>;
-
-    /// 递归创建目录，类似 `mkdir -p`。
-    fn create_dir_all(&self, path: &Path) -> Result<(), FsError>;
-}
-
-// ==================== 本地文件系统实现 ====================
-
-/// 基于本地磁盘的文件系统实现。
-pub struct LocalFs;
-
-impl FileSystem for LocalFs {
-    fn read_file(&self, path: &Path) -> Result<String, FsError> {
-        let metadata = fs::metadata(path);
+    pub async fn read_file(path: &Path) -> Result<String, FsError> {
+        let metadata = tokio::fs::metadata(path).await;
         match metadata {
             Ok(meta) if !meta.is_file() => return Err(FsError::NotAFile(path.to_path_buf())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -77,25 +55,28 @@ impl FileSystem for LocalFs {
             Err(e) => return Err(FsError::Io(e)),
             _ => {}
         }
-        fs::read_to_string(path).map_err(FsError::Io)
+        tokio::fs::read_to_string(path).await.map_err(FsError::Io)
     }
 
-    fn write_file(&self, path: &Path, content: &str) -> Result<(), FsError> {
+    /// 将文本内容写入文件，如果父目录不存在会自动创建。
+    pub async fn write_file(path: &Path, content: &str) -> Result<(), FsError> {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+            tokio::fs::create_dir_all(parent).await?;
         }
-        fs::write(path, content).map_err(FsError::Io)
+        tokio::fs::write(path, content).await.map_err(FsError::Io)
     }
 
-    fn exists(&self, path: &Path) -> bool {
-        path.exists()
+    /// 检查指定路径是否存在。
+    pub async fn exists(path: &Path) -> bool {
+        tokio::fs::metadata(path).await.is_ok()
     }
 
-    fn list_dir(&self, path: &Path) -> Result<Vec<FileEntry>, FsError> {
+    /// 列出目录中的所有条目。
+    pub async fn list_dir(path: &Path) -> Result<Vec<FileEntry>, FsError> {
         let mut entries = Vec::new();
-        for entry in fs::read_dir(path)? {
-            let entry = entry?;
-            let meta = entry.metadata()?;
+        let mut dir = tokio::fs::read_dir(path).await?;
+        while let Some(entry) = dir.next_entry().await? {
+            let meta = entry.metadata().await?;
             entries.push(FileEntry {
                 name: entry.file_name().to_string_lossy().into_owned(),
                 path: entry.path(),
@@ -106,8 +87,9 @@ impl FileSystem for LocalFs {
         Ok(entries)
     }
 
-    fn create_dir_all(&self, path: &Path) -> Result<(), FsError> {
-        fs::create_dir_all(path).map_err(FsError::Io)
+    /// 递归创建目录，类似 `mkdir -p`。
+    pub async fn create_dir_all(path: &Path) -> Result<(), FsError> {
+        tokio::fs::create_dir_all(path).await.map_err(FsError::Io)
     }
 }
 
@@ -131,7 +113,7 @@ mod tests {
                     .unwrap()
                     .as_nanos()
             ));
-            fs::create_dir_all(&path).unwrap();
+            std::fs::create_dir_all(&path).unwrap();
             Self { path }
         }
 
@@ -142,82 +124,75 @@ mod tests {
 
     impl Drop for TempDir {
         fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.path);
+            let _ = std::fs::remove_dir_all(&self.path);
         }
     }
 
-    #[test]
-    fn read_write_text_file() {
-        let fs = LocalFs;
+    #[tokio::test]
+    async fn read_write_text_file() {
         let dir = TempDir::new();
         let file = dir.path().join("test.txt");
 
-        fs.write_file(&file, "hello world").unwrap();
-        let content = fs.read_file(&file).unwrap();
+        FileSystem::write_file(&file, "hello world").await.unwrap();
+        let content = FileSystem::read_file(&file).await.unwrap();
         assert_eq!(content, "hello world");
     }
 
-    #[test]
-    fn write_overwrites_existing() {
-        let fs = LocalFs;
+    #[tokio::test]
+    async fn write_overwrites_existing() {
         let dir = TempDir::new();
         let file = dir.path().join("overwrite.txt");
 
-        fs.write_file(&file, "first").unwrap();
-        fs.write_file(&file, "second").unwrap();
-        assert_eq!(fs.read_file(&file).unwrap(), "second");
+        FileSystem::write_file(&file, "first").await.unwrap();
+        FileSystem::write_file(&file, "second").await.unwrap();
+        assert_eq!(FileSystem::read_file(&file).await.unwrap(), "second");
     }
 
-    #[test]
-    fn write_creates_parent_dirs() {
-        let fs = LocalFs;
+    #[tokio::test]
+    async fn write_creates_parent_dirs() {
         let dir = TempDir::new();
         let file = dir.path().join("a/b/c/deep.txt");
 
-        fs.write_file(&file, "nested").unwrap();
-        assert_eq!(fs.read_file(&file).unwrap(), "nested");
+        FileSystem::write_file(&file, "nested").await.unwrap();
+        assert_eq!(FileSystem::read_file(&file).await.unwrap(), "nested");
     }
 
-    #[test]
-    fn read_nonexistent_file_returns_not_found() {
-        let fs = LocalFs;
+    #[tokio::test]
+    async fn read_nonexistent_file_returns_not_found() {
         let dir = TempDir::new();
         let file = dir.path().join("no_such.txt");
 
-        let err = fs.read_file(&file).unwrap_err();
+        let err = FileSystem::read_file(&file).await.unwrap_err();
         assert!(matches!(err, FsError::NotFound(p) if p == file));
     }
 
-    #[test]
-    fn read_directory_returns_not_a_file() {
-        let fs = LocalFs;
+    #[tokio::test]
+    async fn read_directory_returns_not_a_file() {
         let dir = TempDir::new();
 
-        let err = fs.read_file(dir.path()).unwrap_err();
+        let err = FileSystem::read_file(dir.path()).await.unwrap_err();
         assert!(matches!(err, FsError::NotAFile(_)));
     }
 
-    #[test]
-    fn exists_check() {
-        let fs = LocalFs;
+    #[tokio::test]
+    async fn exists_check() {
         let dir = TempDir::new();
         let file = dir.path().join("check.txt");
 
-        assert!(!fs.exists(&file));
-        fs.write_file(&file, "").unwrap();
-        assert!(fs.exists(&file));
+        assert!(!FileSystem::exists(&file).await);
+        FileSystem::write_file(&file, "").await.unwrap();
+        assert!(FileSystem::exists(&file).await);
     }
 
-    #[test]
-    fn list_dir_returns_entries() {
-        let fs = LocalFs;
+    #[tokio::test]
+    async fn list_dir_returns_entries() {
         let dir = TempDir::new();
 
-        fs.write_file(&dir.path().join("a.txt"), "a").unwrap();
-        fs.write_file(&dir.path().join("b.txt"), "b").unwrap();
-        fs.create_dir_all(&dir.path().join("subdir")).unwrap();
+        FileSystem::write_file(&dir.path().join("a.txt"), "a").await.unwrap();
+        FileSystem::write_file(&dir.path().join("b.txt"), "b").await.unwrap();
+        FileSystem::create_dir_all(&dir.path().join("subdir")).await.unwrap();
 
-        let entries = fs.list_dir(dir.path()).unwrap();
+        let entries = FileSystem::list_dir(dir.path()).await.unwrap();
         assert_eq!(entries.len(), 3);
 
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
@@ -229,14 +204,13 @@ mod tests {
         assert!(subdir.is_dir);
     }
 
-    #[test]
-    fn create_dir_all_idempotent() {
-        let fs = LocalFs;
+    #[tokio::test]
+    async fn create_dir_all_idempotent() {
         let dir = TempDir::new();
         let nested = dir.path().join("x/y/z");
 
-        fs.create_dir_all(&nested).unwrap();
-        fs.create_dir_all(&nested).unwrap();
+        FileSystem::create_dir_all(&nested).await.unwrap();
+        FileSystem::create_dir_all(&nested).await.unwrap();
         assert!(nested.is_dir());
     }
 }
