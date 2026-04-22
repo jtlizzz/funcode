@@ -8,7 +8,7 @@
 //! - 组织工具执行结果回传给 Agent
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use schemars::JsonSchema;
@@ -362,6 +362,177 @@ impl Tool for FileWriteTool {
             args.content.len(),
             args.file_path
         ))
+    }
+}
+
+// ==================== GlobTool ====================
+
+/// 文件搜索工具的输入参数。
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GlobInput {
+    /// Glob 匹配模式。
+    #[schemars(description = "The glob pattern to match files against (e.g. \"**/*.rs\", \"src/**/*.ts\")")]
+    pub pattern: String,
+    /// 搜索的目录路径。
+    #[schemars(description = "The directory to search in")]
+    pub path: String,
+}
+
+/// 文件搜索工具，基于 ripgrep 的 globset + ignore 实现。
+pub struct GlobTool;
+
+impl GlobTool {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl Tool for GlobTool {
+    fn name(&self) -> &str {
+        "Glob"
+    }
+
+    fn description(&self) -> &str {
+        "Search for files matching a glob pattern. Respects .gitignore rules."
+    }
+
+    fn parameters(&self) -> Value {
+        schema_for::<GlobInput>()
+    }
+
+    async fn execute(&self, arguments: &str) -> Result<String, ToolError> {
+        let args: GlobInput = parse_arguments(arguments, "Glob")?;
+
+        let matcher = globset::GlobBuilder::new(&args.pattern)
+            .literal_separator(true)
+            .build()
+            .map_err(|e| ToolError::Arguments(format!("invalid glob pattern: {e}")))?
+            .compile_matcher();
+
+        let base = PathBuf::from(&args.path);
+        if !base.exists() {
+            return Err(ToolError::Execution(format!("path does not exist: {}", args.path)));
+        }
+
+        let results = tokio::task::spawn_blocking(move || {
+            let mut matched = Vec::new();
+            for entry in ignore::WalkBuilder::new(&base).build() {
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+                let relative = entry
+                    .path()
+                    .strip_prefix(&base)
+                    .unwrap_or(entry.path());
+                if matcher.is_match(relative) {
+                    matched.push(entry.path().display().to_string());
+                }
+            }
+            matched
+        })
+        .await
+        .map_err(|e| ToolError::Execution(e.to_string()))?;
+
+        if results.is_empty() {
+            Ok("no files matched the pattern".to_string())
+        } else {
+            Ok(results.join("\n"))
+        }
+    }
+}
+
+// ==================== BashTool ====================
+
+/// Bash 工具的输入参数。
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct BashInput {
+    /// 命令的简短描述。
+    #[schemars(description = "A short description of what this command does")]
+    pub description: String,
+    /// 要执行的 bash 命令。
+    #[schemars(description = "The bash command to execute")]
+    pub command: String,
+    /// 超时时间（秒），默认 120 秒。
+    #[schemars(description = "Timeout in seconds (defaults to 120)")]
+    pub timeout: Option<u64>,
+}
+
+/// Bash 命令执行工具。
+pub struct BashTool;
+
+impl BashTool {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl Tool for BashTool {
+    fn name(&self) -> &str {
+        "Bash"
+    }
+
+    fn description(&self) -> &str {
+        "Executes a bash command and returns the output."
+    }
+
+    fn parameters(&self) -> Value {
+        schema_for::<BashInput>()
+    }
+
+    async fn execute(&self, arguments: &str) -> Result<String, ToolError> {
+        let args: BashInput = parse_arguments(arguments, "Bash")?;
+
+        let timeout_secs = args.timeout.unwrap_or(120);
+
+        let mut cmd = tokio::process::Command::new("/bin/bash");
+        cmd.arg("-c").arg(&args.command);
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            cmd.output(),
+        )
+        .await
+        .map_err(|_| {
+            ToolError::Execution(format!(
+                "command timed out after {} seconds",
+                timeout_secs
+            ))
+        })?
+        .map_err(ToolError::from)?;
+
+        let mut result = String::new();
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if !stdout.is_empty() {
+            result.push_str(&stdout);
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.is_empty() {
+            if !result.is_empty() {
+                result.push('\n');
+            }
+            result.push_str(&stderr);
+        }
+
+        if !output.status.success() {
+            return Err(ToolError::Execution(format!(
+                "exit code {}: {}",
+                output.status.code().unwrap_or(-1),
+                result
+            )));
+        }
+
+        if result.is_empty() {
+            Ok("(no output)".to_string())
+        } else {
+            Ok(result)
+        }
     }
 }
 
