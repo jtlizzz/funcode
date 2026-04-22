@@ -15,14 +15,21 @@ use crate::model::TokenUsage;
 pub enum Event {
     // Turn 生命周期
     TurnStarted,
-    TurnComplete { usage: Option<TokenUsage> },
+    /// 用户或外部取消信号中断了当前 turn。
+    TurnInterrupted,
+    TurnComplete {
+        usage: Option<TokenUsage>,
+    },
 
     // 模型输出（流式）
     TextDelta(String),
     TextDone(String),
 
     // 工具调用
-    ToolCallBegin { id: String, name: String },
+    ToolCallBegin {
+        id: String,
+        name: String,
+    },
     ToolCallEnd {
         id: String,
         name: String,
@@ -128,7 +135,10 @@ mod tests {
         bus.publish(Event::TextDelta("hello".to_string()));
 
         let result = sub.recv().await;
-        assert!(matches!(result, Some(ReceiveResult::Event(Event::TurnStarted))));
+        assert!(matches!(
+            result,
+            Some(ReceiveResult::Event(Event::TurnStarted))
+        ));
 
         let result = sub.recv().await;
         assert!(matches!(

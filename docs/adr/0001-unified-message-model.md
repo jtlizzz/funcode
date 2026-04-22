@@ -1,8 +1,10 @@
 # ADR-0001: Unified message model with role-specific enum
 
 **Date**: 2026-04-25
-**Status**: accepted
+**Status**: superseded by ADR-0009
 **Deciders**: project lead
+
+> Superseded by `docs/adr/0009-canonical-item-model.md` on 2026-04-26.
 
 ## Context
 

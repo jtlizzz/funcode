@@ -31,8 +31,8 @@ All external interactions with `Agent` go through a single `submit(&mut self, op
 Phase 1 includes two variants; future variants (`SwitchModel`, `CancelTool`) can be added
 without changing the call signature.
 
-Interrupt uses `tokio::sync::watch::Sender<bool>` -- a lightweight signal that the Agent loop
-checks at each iteration and during stream consumption.
+Interrupt uses a turn-scoped `tokio_util::sync::CancellationToken` so the Agent can propagate
+explicit cancellation into the model streaming path.
 
 ## Alternatives Considered
 
@@ -64,8 +64,8 @@ tx.send(AgentCommand::UserTurn(text)).await;
 ### Positive
 - Single entry point makes state transitions explicit and serializable.
 - Easy to add new operations without changing the external API.
-- Interrupt signal is non-blocking and checkable from async contexts.
-- `watch::Sender<bool>` is lightweight -- no allocation per check.
+- Interrupt signal is non-blocking and propagates naturally through async call chains.
+- `CancellationToken` is the ecosystem-standard primitive for cooperative async cancellation.
 
 ### Negative
 - `submit()` is `&mut self`, so only one operation at a time. This blocks concurrent

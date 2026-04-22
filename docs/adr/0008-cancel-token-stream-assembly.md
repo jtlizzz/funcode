@@ -1,200 +1,125 @@
 # ADR 0008: CancellationToken + 流式组装职责统一
 
-**状态**: 待实施
+**状态**: accepted
 **日期**: 2026-04-26
 
 ## 背景
 
-当前 agent.rs 和 model.rs 存在两个问题：
+在引入顶层 `Item` 作为 canonical 对话模型之前，`agent.rs` 和 `model.rs` 曾经同时承担部分
+流式组装职责：
 
-1. **双重累积**：model.rs 的 OpenAIProvider::stream 内部累积 text + PartialToolCall 组装完整 blocks，通过 MessageDone 事件发出；agent.rs 的 consume_stream 又从 TextDelta/ToolCallReady 重新累积了一遍，MessageDone 携带的完整消息被忽略。
-2. **中断信号无法传递到 model 层**：用户中断后，agent 的 consume_stream break 退出，ResponseStream 被 drop，spawned task 只在下一次 tx_event.send() 失败时才发现。中间有窗口期继续消耗 SSE 数据。
+1. `model.rs` 在 provider stream 内累积完整响应。
+2. `agent.rs` 再次从 `TextDelta` / `ToolCallReady` 重新拼装最终结果。
+3. 用户中断通过 `watch::Sender<bool>` 传播，只能让 agent 侧尽快退出，不能明确传达到 model
+   层的流式任务。
+
+这会带来两个问题：
+
+- **职责重复**：完整响应到底以哪一层的累积结果为准并不清晰。
+- **取消语义含糊**：中断更像“本地 break”，而不是明确的 turn 级取消信号。
+
+在采纳 ADR-0009 的 `Vec<Item>` 内部模型后，这两个问题更需要收口：
+
+- `Model` 应该产出权威的“完成态 item 事件”和终态 `Completed`
+- `Agent` 应只消费流式 domain event，不再从 delta 重复累积完整消息
 
 ## 决策
 
-### 1. 引入 `tokio_util::sync::CancellationToken`
+### 1. 使用 `tokio_util::sync::CancellationToken`
 
-替换当前的 `watch::Sender/Receiver<bool>` 中断机制。
+`Agent` 的 turn 级中断机制统一采用 `CancellationToken`，替换之前的
+`watch::Sender/Receiver<bool>`。
 
-**理由**：
-- CancellationToken 是 Rust 异步生态取消的事实标准（Codex CLI 直接使用）
-- `child_token()` 天然级联：父取消 → 子全部取消
-- `.or_cancel(&token)` 直接绑定 Future，无需手动检查
-- 语义清晰："取消操作" 而非 "广播一个布尔值"
+理由：
 
-**参考**：
-- Codex CLI `codex-rs/core/src/codex.rs:7052-7059` — `.or_cancel(&cancellation_token)` 在每个 stream.next() 上绑定
-- Codex CLI `codex-rs/core/src/tasks/mod.rs:169-200` — CancellationToken 创建 + child_token 传递
-- Codex CLI `codex-rs/core/src/tasks/mod.rs:404-425` — cancel() 触发后优雅等待 + 超时 abort
-- Claude Code `src/query.ts:707` — AbortSignal 从 agent 层传入 API 层
+- `CancellationToken` 是 Rust 异步生态中更自然的取消原语
+- 语义明确：这是“取消当前 turn”，而不是“轮询一个布尔值”
+- 能直接传入 model/provider 层，让流式任务感知取消
 
-### 2. Model 层负责消息组装，Agent 层只消费
+### 2. provider 负责把取消转成显式 stream event
 
-Model 层（ResponseStream）作为有状态的领域对象：一边推送增量事件（TextDelta、ToolCallStart），一边内部自动累积完整 blocks。最终通过 MessageDone 提供权威结果。
+`ResponseStream` 自身只做事件通道，不再在 `poll_next()` 中抢先检查取消。
 
-Agent 层 consume_stream 的职责简化为：
-- 从增量事件推 Bus（给 UI 实时渲染）
-- 从 MessageDone 取最终 blocks（给 session 存储）
-- 不做任何重复累积
+取消由 provider 的流式任务处理：
 
-## 改造计划
+- 上游收到 `CancellationToken` 后停止继续消费 SSE
+- 向 `ResponseStream` 发出显式 `ResponseEvent::Cancelled`
 
-### Step 1: Cargo.toml 添加依赖
+这样可以避免 consumer 侧为了响应取消而丢弃已经入队的权威完成态事件。
 
-```toml
-tokio-util = { version = "0.7", features = ["rt"] }
-```
+### 3. `TextDone` / `ToolCallReady` / `Completed` 是流式权威完成态，`Agent` 只消费
 
-### Step 2: model.rs — ResponseStream 持有 CancellationToken
+`Agent` 的 turn 主循环直接内联 stream event loop：
 
-```rust
-pub struct ResponseStream {
-    rx_event: mpsc::Receiver<Result<ResponseEvent, ModelError>>,
-    cancel: CancellationToken,
-}
+- `TextDelta` / `ToolCallStart` 只做观察事件转发
+- `Cancelled` 结束当前 turn，并通过 `Bus` 发出 `TurnInterrupted`
+- `TextDone` 表示一条完整 assistant 文本已经完成，可直接写入 `Session`
+- `ToolCallReady` 表示一条完整 tool call 已经完成，可直接写入 `Session`
+- `Completed` 提供本次模型响应的 `usage` 与 `finish_reason`
 
-impl Stream for ResponseStream {
-    type Item = Result<ResponseEvent, ModelError>;
+`Agent` 不再保留独立的 `consume_stream()` 聚合器，也不再从增量事件重新拼装最终响应。
+消息和工具调用的组装仍由 `Model` 在 provider stream 内部完成；`Agent` 只消费完成后的领域事件。
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if self.cancel.is_cancelled() {
-            return Poll::Ready(None);
-        }
-        self.rx_event.poll_recv(cx)
-    }
-}
-```
+### 4. 中断不是错误
 
-### Step 3: model.rs — ModelProvider::stream() 签名加 cancel
+用户取消当前 turn 属于预期控制流，不属于错误。
+
+因此在 `Bus` 中增加独立事件：
 
 ```rust
-#[async_trait]
-pub trait ModelProvider: Send + Sync {
-    async fn send(&self, model: &str, request: ModelRequest) -> Result<ModelResponse, ModelError>;
-    async fn stream(
-        &self,
-        model: &str,
-        request: ModelRequest,
-        cancel: CancellationToken,
-    ) -> Result<ResponseStream, ModelError>;
-}
-
-impl Model {
-    pub async fn stream(&self, request: ModelRequest, cancel: CancellationToken) -> Result<ResponseStream, ModelError> {
-        self.provider.stream(&self.model, request, cancel).await
-    }
-}
+Event::TurnInterrupted
 ```
 
-### Step 4: model.rs — OpenAIProvider spawned task 检查 cancel
+而不是继续复用：
 
 ```rust
-let task_cancel = cancel.clone();
-tokio::spawn(async move {
-    while let Some(result) = stream.next().await {
-        if task_cancel.is_cancelled() { return; }
-        // ... 原有 chunk 处理逻辑不变
-    }
-    // ... 原有 ToolCallReady + MessageDone 发射逻辑不变
-});
-Ok(ResponseStream { rx_event, cancel })
+Event::Error("interrupted".to_string())
 ```
 
-### Step 5: agent.rs — CancellationToken 替换 watch channel
+## 实施结果
 
-```rust
-pub struct Agent {
-    model: Model,
-    session: Session,
-    registry: ToolRegistry,
-    bus: Bus,
-    max_turns: usize,
-    cancel: CancellationToken,     // 替换 interrupt_tx/rx
-}
+本 ADR 当前对应的实现包括：
 
-// Op::Interrupt 时：
-self.cancel.cancel();
+- `Cargo.toml`
+  - 添加 `tokio-util`
+- `src/agent.rs`
+  - `watch` 中断机制替换为 `CancellationToken`
+  - stream event loop 内联到 `run_turn()`
+  - `Cancelled` -> `Event::TurnInterrupted`
+  - `TextDone` / `ToolCallReady` 到达时立即把完成 item 写入 `Session`
+  - `Completed` 到达后记录 `usage` 并判定本轮模型流正常结束
+- `src/model.rs`
+  - `ModelProvider::stream()` 签名接收 `CancellationToken`
+  - provider 侧在取消时发出 `ResponseEvent::Cancelled`
+  - provider 侧产出完成态事件：
+    - `ResponseEvent::TextDone(String)`
+    - `ResponseEvent::ToolCallReady { ... }`
+    - `ResponseEvent::Completed { usage, finish_reason }`
+- `src/bus.rs`
+  - 新增 `Event::TurnInterrupted`
 
-// Op::UserTurn 时重置：
-self.cancel = CancellationToken::new();
-```
+## 影响
 
-### Step 6: agent.rs — consume_stream 简化
+### 优点
 
-```rust
-async fn consume_stream(
-    &mut self,
-    mut stream: ResponseStream,
-) -> (Vec<AssistantBlock>, Option<TokenUsage>) {
-    let mut final_response = None;
+- `Agent` / `Model` 的职责边界更清晰
+- turn 中断语义更明确
+- 避免 consumer 侧取消抢先丢弃已缓冲的权威完成态事件
+- 为后续 `ToolCallReady` 驱动的流式工具调度打下基础
 
-    loop {
-        let result = match stream.next().or_cancel(&self.cancel).await {
-            Ok(Some(r)) => r,
-            Ok(None) => break,
-            Err(_) => {
-                self.bus.publish(Event::Error("interrupted".into()));
-                break;
-            }
-        };
+### 当前不涵盖的范围
 
-        match result {
-            Ok(ResponseEvent::TextDelta(delta)) => {
-                self.bus.publish(Event::TextDelta(delta));
-            }
-            Ok(ResponseEvent::ToolCallBegin { id, name }) => {
-                self.bus.publish(Event::ToolCallBegin { id, name });
-            }
-            Ok(ResponseEvent::ToolCallReady { .. }) => {
-                // Phase 2: 在这里 spawn 工具执行
-            }
-            Ok(ResponseEvent::MessageDone(response)) => {
-                final_response = Some(response);
-            }
-            Err(err) => {
-                self.bus.publish(Event::Error(err.to_string()));
-                break;
-            }
-        }
-    }
+本 ADR 当前只保证中断流式模型响应。
 
-    match final_response {
-        Some(resp) => {
-            let blocks = match resp.message {
-                Message::Assistant(b) => b,
-                _ => vec![],
-            };
-            if let Some(text) = blocks.iter().find_map(|b| match b {
-                AssistantBlock::Text(t) => Some(t.clone()),
-                _ => None,
-            }) {
-                self.bus.publish(Event::TextDone(text));
-            }
-            (blocks, resp.usage)
-        }
-        None => (vec![], None),
-    }
-}
-```
+工具执行取消仍未实现：
 
-### Step 7: 测试适配
+- `Tool::execute()` 还没有接收 `CancellationToken`
+- `Agent::Interrupt` 还不会中止已经开始运行的工具
 
-- 所有 mock provider 的 `stream()` 签名加 `CancellationToken` 参数
-- `interrupt_signal_works` 测试改用 `cancel.cancel()` 验证
-- 新增测试：验证流式中途取消时 spawned task 停止
+这部分留待后续迭代处理。
 
-## 影响范围
+## 参考
 
-| 文件 | 改动 |
-|------|------|
-| `Cargo.toml` | 添加 `tokio-util` |
-| `model.rs` | ResponseStream 加 cancel 字段；Stream impl 检查取消；ModelProvider::stream 签名变更；OpenAIProvider spawned task 检查取消 |
-| `agent.rs` | 去掉 watch channel 换 CancellationToken；consume_stream 去掉重复累积，用 .or_cancel()，从 MessageDone 取结果 |
-| `bus.rs` | 无变更 |
-| `session.rs` | 无变更 |
-| `tools.rs` | 无变更 |
-
-## 未来兼容
-
-- Phase 2 流式工具执行：ToolCallReady 在 spawned task 内参数接收完毕时立即发射，agent 收到即可 spawn 执行
-- `child_token()` 支持工具执行级别的独立取消
+- Codex CLI `codex-rs/core/src/codex.rs`
+- Codex CLI `codex-rs/core/src/tools/parallel.rs`
+- Claude Code `src/query.ts`

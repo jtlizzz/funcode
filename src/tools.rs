@@ -155,8 +155,8 @@ mod tests {
         }
 
         async fn execute(&self, arguments: &str) -> Result<String, ToolError> {
-            let _: Value = serde_json::from_str(arguments)
-                .map_err(|e| ToolError::InvalidArguments {
+            let _: Value =
+                serde_json::from_str(arguments).map_err(|e| ToolError::InvalidArguments {
                     name: "echo".to_string(),
                     reason: e.to_string(),
                 })?;

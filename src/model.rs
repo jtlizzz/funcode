@@ -1,13 +1,11 @@
 //! Model access module.
 //!
-//! Defines the internal unified message model and [`ModelProvider`] trait,
+//! Defines the internal canonical item model and [`ModelProvider`] trait,
 //! with an OpenAI-compatible implementation via `async-openai`: [`OpenAIProvider`].
 
 #![allow(dead_code)]
 
-use std::pin::Pin;
-use std::task::{Context, Poll};
-
+use async_openai::Client as OpenAIClient;
 use async_openai::config::OpenAIConfig;
 use async_openai::error::OpenAIError;
 use async_openai::types::chat::{
@@ -21,28 +19,77 @@ use async_openai::types::chat::{
     CreateChatCompletionRequest, CreateChatCompletionResponse, FinishReason, FunctionCall,
     FunctionObject,
 };
-use async_openai::Client as OpenAIClient;
 use async_trait::async_trait;
 use futures_util::{Stream, StreamExt};
 use serde_json::Value;
 use thiserror::Error;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
-// ==================== Message Types ====================
+// ==================== Item / Message Types ====================
 
-/// Internal unified message model.
+/// Internal canonical conversation item model.
+///
+/// `Item` is the provider-neutral history unit used by Session / Agent.
+/// Provider-specific message/block shapes are projected to and from this enum
+/// inside adapter code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Item {
+    Message(Message),
+    ToolCall(ToolCall),
+    ToolResult(ToolResult),
+}
+
+impl Item {
+    pub fn message(message: Message) -> Self {
+        Self::Message(message)
+    }
+
+    pub fn system(text: impl Into<String>) -> Self {
+        Self::Message(Message::system(text))
+    }
+
+    pub fn user(text: impl Into<String>) -> Self {
+        Self::Message(Message::user(text))
+    }
+
+    pub fn assistant(text: impl Into<String>) -> Self {
+        Self::Message(Message::assistant(text))
+    }
+
+    pub fn tool_call(call: ToolCall) -> Self {
+        Self::ToolCall(call)
+    }
+
+    pub fn tool_result(result: ToolResult) -> Self {
+        Self::ToolResult(result)
+    }
+
+    pub fn text_content(&self) -> Option<&str> {
+        match self {
+            Item::Message(message) => message.text_content(),
+            Item::ToolCall(call) => Some(call.arguments.as_str()),
+            Item::ToolResult(result) => Some(result.content.as_str()),
+        }
+    }
+
+    pub fn as_tool_call(&self) -> Option<&ToolCall> {
+        match self {
+            Item::ToolCall(call) => Some(call),
+            _ => None,
+        }
+    }
+}
+
+/// Internal role-based text message model.
 ///
 /// Each variant is role-specific and only carries data valid for that role,
-/// preventing illegal message combinations at compile time.
+/// while tool calls/results are represented by sibling [`Item`] variants.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
     System(String),
     User(String),
-    Assistant(Vec<AssistantBlock>),
-    Tool {
-        call: ToolCall,
-        result: ToolResult,
-    },
+    Assistant(String),
 }
 
 impl Message {
@@ -54,49 +101,19 @@ impl Message {
         Self::User(text.into())
     }
 
-    pub fn assistant(blocks: Vec<AssistantBlock>) -> Self {
-        Self::Assistant(blocks)
+    pub fn assistant(text: impl Into<String>) -> Self {
+        Self::Assistant(text.into())
     }
 
     pub fn assistant_text(text: impl Into<String>) -> Self {
-        Self::Assistant(vec![AssistantBlock::text(text)])
+        Self::assistant(text)
     }
 
-    pub fn tool(call: ToolCall, result: ToolResult) -> Self {
-        Self::Tool { call, result }
-    }
-
-    /// Extract the first text fragment from the message.
+    /// Extract plain text from the message when available.
     pub fn text_content(&self) -> Option<&str> {
         match self {
-            Message::System(t) | Message::User(t) => Some(t),
-            Message::Assistant(blocks) => blocks.iter().find_map(|b| match b {
-                AssistantBlock::Text(t) => Some(t.as_str()),
-                _ => None,
-            }),
-            Message::Tool { .. } => None,
+            Message::System(t) | Message::User(t) | Message::Assistant(t) => Some(t),
         }
-    }
-}
-
-/// Content blocks within an assistant message.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AssistantBlock {
-    Text(String),
-    ToolCall(ToolCall),
-}
-
-impl AssistantBlock {
-    pub fn text(text: impl Into<String>) -> Self {
-        Self::Text(text.into())
-    }
-
-    pub fn tool_call(
-        id: impl Into<String>,
-        name: impl Into<String>,
-        arguments: impl Into<String>,
-    ) -> Self {
-        Self::ToolCall(ToolCall::new(id, name, arguments))
     }
 }
 
@@ -165,15 +182,15 @@ impl ToolResult {
 /// A single model invocation request.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelRequest {
-    pub messages: Vec<Message>,
+    pub items: Vec<Item>,
     pub tools: Vec<ToolSpec>,
     pub temperature: Option<f32>,
 }
 
 impl ModelRequest {
-    pub fn new(messages: Vec<Message>) -> Self {
+    pub fn new(items: Vec<Item>) -> Self {
         Self {
-            messages,
+            items,
             tools: Vec::new(),
             temperature: None,
         }
@@ -193,7 +210,7 @@ impl ModelRequest {
 /// A single model invocation response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelResponse {
-    pub message: Message,
+    pub items: Vec<Item>,
     pub finish_reason: Option<String>,
     pub usage: Option<TokenUsage>,
 }
@@ -206,15 +223,23 @@ pub enum ResponseEvent {
         id: String,
         name: String,
     },
+    TextDone(String),
     ToolCallReady {
         id: String,
         name: String,
         arguments: String,
     },
-    MessageDone(ModelResponse),
+    Cancelled,
+    Completed {
+        usage: Option<TokenUsage>,
+        finish_reason: Option<String>,
+    },
 }
 
 /// A model streaming response handle.
+///
+/// ResponseStream 只负责传递 provider 产生的事件。
+/// 取消语义由 provider 转换成显式的 [`ResponseEvent::Cancelled`]。
 pub struct ResponseStream {
     pub rx_event: mpsc::Receiver<Result<ResponseEvent, ModelError>>,
 }
@@ -228,7 +253,10 @@ impl ResponseStream {
 impl Stream for ResponseStream {
     type Item = Result<ResponseEvent, ModelError>;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
         self.rx_event.poll_recv(cx)
     }
 }
@@ -295,6 +323,7 @@ pub trait ModelProvider: Send + Sync {
         &self,
         model: &str,
         request: ModelRequest,
+        cancel: CancellationToken,
     ) -> Result<ResponseStream, ModelError>;
 }
 
@@ -322,8 +351,12 @@ impl Model {
         self.provider.send(&self.model, request).await
     }
 
-    pub async fn stream(&self, request: ModelRequest) -> Result<ResponseStream, ModelError> {
-        self.provider.stream(&self.model, request).await
+    pub async fn stream(
+        &self,
+        request: ModelRequest,
+        cancel: CancellationToken,
+    ) -> Result<ResponseStream, ModelError> {
+        self.provider.stream(&self.model, request, cancel).await
     }
 }
 
@@ -336,10 +369,7 @@ pub struct OpenAIProvider {
 }
 
 impl OpenAIProvider {
-    pub fn new(
-        api_key: impl Into<String>,
-        base_url: Option<String>,
-    ) -> Result<Self, ModelError> {
+    pub fn new(api_key: impl Into<String>, base_url: Option<String>) -> Result<Self, ModelError> {
         let api_key = api_key.into();
         if api_key.trim().is_empty() {
             return Err(ModelError::EmptyApiKey);
@@ -371,11 +401,15 @@ impl ModelProvider for OpenAIProvider {
         &self,
         model: &str,
         request: ModelRequest,
+        cancel: CancellationToken,
     ) -> Result<ResponseStream, ModelError> {
         let req = build_request(model, request)?;
         let stream = self.client.chat().create_stream(req).await?;
 
         let (tx_event, rx_event) = mpsc::channel(32);
+
+        // 参考 Codex CLI: spawned task 使用 child_token 确保取消独立
+        let task_cancel = cancel.child_token();
         tokio::spawn(async move {
             let mut text = String::new();
             let mut tool_calls: Vec<PartialToolCall> = Vec::new();
@@ -385,8 +419,19 @@ impl ModelProvider for OpenAIProvider {
             let stream: ChatCompletionResponseStream = stream;
             let mut stream = std::pin::pin!(stream);
 
-            while let Some(result) = stream.next().await {
-                let chunk = match result {
+            loop {
+                // 参考 Codex CLI `codex-rs/core/src/codex.rs:7052-7059`:
+                // 用 tokio::select! 将 SSE stream.next() 与 cancel.cancelled() 竞争
+                let result = tokio::select! {
+                    _ = task_cancel.cancelled() => {
+                        let _ = tx_event.send(Ok(ResponseEvent::Cancelled)).await;
+                        return;
+                    }
+                    r = stream.next() => r,
+                };
+
+                let Some(chunk_result) = result else { break };
+                let chunk = match chunk_result {
                     Ok(chunk) => chunk,
                     Err(err) => {
                         let _ = tx_event.send(Err(ModelError::OpenAI(err))).await;
@@ -447,10 +492,11 @@ impl ModelProvider for OpenAIProvider {
                 }
             }
 
-            // Stream ended — emit ToolCallReady + MessageDone
-            let mut blocks = Vec::new();
+            // Stream ended — emit completed domain events, then a terminal Completed.
             if !text.is_empty() {
-                blocks.push(AssistantBlock::Text(text));
+                if tx_event.send(Ok(ResponseEvent::TextDone(text))).await.is_err() {
+                    return;
+                }
             }
             for call in tool_calls {
                 let id = match call.id {
@@ -486,19 +532,13 @@ impl ModelProvider for OpenAIProvider {
                 {
                     return;
                 }
-                blocks.push(AssistantBlock::ToolCall(ToolCall::new(
-                    id,
-                    name,
-                    call.arguments,
-                )));
             }
 
             let _ = tx_event
-                .send(Ok(ResponseEvent::MessageDone(ModelResponse {
-                    message: Message::Assistant(blocks),
+                .send(Ok(ResponseEvent::Completed {
                     finish_reason,
                     usage,
-                })))
+                }))
                 .await;
         });
 
@@ -528,11 +568,9 @@ fn ensure_partial(
     if index == tool_calls.len() {
         tool_calls.push(PartialToolCall::default());
     }
-    tool_calls
-        .get_mut(index)
-        .ok_or(ModelError::StreamProtocol(
-            "tool call delta index out of bounds",
-        ))
+    tool_calls.get_mut(index).ok_or(ModelError::StreamProtocol(
+        "tool call delta index out of bounds",
+    ))
 }
 
 async fn maybe_emit_start(
@@ -546,12 +584,7 @@ async fn maybe_emit_start(
         return;
     };
     partial.announced_start = true;
-    let _ = tx
-        .send(Ok(ResponseEvent::ToolCallStart {
-            id,
-            name,
-        }))
-        .await;
+    let _ = tx.send(Ok(ResponseEvent::ToolCallStart { id, name })).await;
 }
 
 // ==================== OpenAI Request Building ====================
@@ -560,11 +593,7 @@ fn build_request(
     model: &str,
     request: ModelRequest,
 ) -> Result<CreateChatCompletionRequest, ModelError> {
-    let messages = request
-        .messages
-        .iter()
-        .map(message_to_openai)
-        .collect::<Result<Vec<_>, _>>()?;
+    let messages = items_to_openai_messages(&request.items)?;
 
     let mut req = CreateChatCompletionRequest {
         model: model.to_string(),
@@ -597,62 +626,87 @@ fn build_request(
     Ok(req)
 }
 
-fn message_to_openai(message: &Message) -> Result<ChatCompletionRequestMessage, ModelError> {
-    match message {
-        Message::System(text) => Ok(ChatCompletionRequestMessage::System(
-            ChatCompletionRequestSystemMessage {
-                content: ChatCompletionRequestSystemMessageContent::Text(text.clone()),
-                name: None,
-            },
-        )),
-        Message::User(text) => Ok(ChatCompletionRequestMessage::User(
-            ChatCompletionRequestUserMessage {
-                content: ChatCompletionRequestUserMessageContent::Text(text.clone()),
-                name: None,
-            },
-        )),
-        Message::Assistant(blocks) => {
-            let mut text_parts = Vec::new();
-            let mut tool_calls = Vec::new();
+fn items_to_openai_messages(
+    items: &[Item],
+) -> Result<Vec<ChatCompletionRequestMessage>, ModelError> {
+    let mut messages = Vec::new();
+    let mut index = 0;
 
-            for block in blocks {
-                match block {
-                    AssistantBlock::Text(text) => text_parts.push(text.clone()),
-                    AssistantBlock::ToolCall(call) => {
-                        tool_calls.push(ChatCompletionMessageToolCalls::Function(
-                            ChatCompletionMessageToolCall {
-                                id: call.id.clone(),
-                                function: FunctionCall {
-                                    name: call.name.clone(),
-                                    arguments: call.arguments.clone(),
+    while index < items.len() {
+        match &items[index] {
+            Item::Message(Message::System(text)) => {
+                messages.push(ChatCompletionRequestMessage::System(
+                    ChatCompletionRequestSystemMessage {
+                        content: ChatCompletionRequestSystemMessageContent::Text(text.clone()),
+                        name: None,
+                    },
+                ));
+                index += 1;
+            }
+            Item::Message(Message::User(text)) => {
+                messages.push(ChatCompletionRequestMessage::User(
+                    ChatCompletionRequestUserMessage {
+                        content: ChatCompletionRequestUserMessageContent::Text(text.clone()),
+                        name: None,
+                    },
+                ));
+                index += 1;
+            }
+            Item::ToolResult(result) => {
+                messages.push(ChatCompletionRequestMessage::Tool(
+                    ChatCompletionRequestToolMessage {
+                        content: ChatCompletionRequestToolMessageContent::Text(
+                            result.content.clone(),
+                        ),
+                        tool_call_id: result.tool_call_id.clone(),
+                    },
+                ));
+                index += 1;
+            }
+            Item::Message(Message::Assistant(_)) | Item::ToolCall(_) => {
+                let mut text_parts = Vec::new();
+                let mut tool_calls = Vec::new();
+
+                while index < items.len() {
+                    match &items[index] {
+                        Item::Message(Message::Assistant(text)) => {
+                            text_parts.push(text.clone());
+                            index += 1;
+                        }
+                        Item::ToolCall(call) => {
+                            tool_calls.push(ChatCompletionMessageToolCalls::Function(
+                                ChatCompletionMessageToolCall {
+                                    id: call.id.clone(),
+                                    function: FunctionCall {
+                                        name: call.name.clone(),
+                                        arguments: call.arguments.clone(),
+                                    },
                                 },
-                            },
-                        ));
+                            ));
+                            index += 1;
+                        }
+                        _ => break,
                     }
                 }
-            }
 
-            Ok(ChatCompletionRequestMessage::Assistant(
-                ChatCompletionRequestAssistantMessage {
-                    content: join_text_parts(text_parts)
-                        .map(ChatCompletionRequestAssistantMessageContent::Text),
-                    name: None,
-                    tool_calls: if tool_calls.is_empty() {
-                        None
-                    } else {
-                        Some(tool_calls)
+                messages.push(ChatCompletionRequestMessage::Assistant(
+                    ChatCompletionRequestAssistantMessage {
+                        content: join_text_parts(text_parts)
+                            .map(ChatCompletionRequestAssistantMessageContent::Text),
+                        name: None,
+                        tool_calls: if tool_calls.is_empty() {
+                            None
+                        } else {
+                            Some(tool_calls)
+                        },
+                        ..Default::default()
                     },
-                    ..Default::default()
-                },
-            ))
+                ));
+            }
         }
-        Message::Tool { call, result } => Ok(ChatCompletionRequestMessage::Tool(
-            ChatCompletionRequestToolMessage {
-                content: ChatCompletionRequestToolMessageContent::Text(result.content.clone()),
-                tool_call_id: call.id.clone(),
-            },
-        )),
     }
+
+    Ok(messages)
 }
 
 fn join_text_parts(parts: Vec<String>) -> Option<String> {
@@ -671,24 +725,24 @@ fn parse_response(response: CreateChatCompletionResponse) -> Result<ModelRespons
         .into_iter()
         .next()
         .ok_or(ModelError::EmptyChoices)?;
-    let message = openai_message_to_chat(choice.message)?;
+    let items = openai_message_to_items(choice.message)?;
     let usage = response.usage.map(token_usage_from_completion);
 
     Ok(ModelResponse {
-        message,
+        items,
         finish_reason: choice.finish_reason.map(finish_reason_to_string),
         usage,
     })
 }
 
-fn openai_message_to_chat(
+fn openai_message_to_items(
     message: ChatCompletionResponseMessage,
-) -> Result<Message, ModelError> {
-    let mut blocks = Vec::new();
+) -> Result<Vec<Item>, ModelError> {
+    let mut items = Vec::new();
 
     if let Some(content) = message.content {
         if !content.is_empty() {
-            blocks.push(AssistantBlock::Text(content));
+            items.push(Item::assistant(content));
         }
     }
 
@@ -696,7 +750,7 @@ fn openai_message_to_chat(
         for tool_call in tool_calls {
             match tool_call {
                 ChatCompletionMessageToolCalls::Function(func_call) => {
-                    blocks.push(AssistantBlock::ToolCall(ToolCall::new(
+                    items.push(Item::ToolCall(ToolCall::new(
                         func_call.id,
                         func_call.function.name,
                         func_call.function.arguments,
@@ -711,7 +765,7 @@ fn openai_message_to_chat(
         }
     }
 
-    Ok(Message::Assistant(blocks))
+    Ok(items)
 }
 
 fn finish_reason_to_string(reason: FinishReason) -> String {
@@ -741,66 +795,53 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn create_text_messages() {
+    fn create_text_items() {
         let system = Message::system("You are helpful.");
         let user = Message::user("hello");
         let assistant = Message::assistant_text("hi");
 
         assert!(matches!(system, Message::System(ref s) if s == "You are helpful."));
         assert!(matches!(user, Message::User(ref s) if s == "hello"));
-        assert!(matches!(assistant, Message::Assistant(_)));
+        assert!(matches!(assistant, Message::Assistant(ref s) if s == "hi"));
         assert_eq!(assistant.text_content(), Some("hi"));
     }
 
     #[test]
-    fn assistant_with_text_and_tool_call() {
-        let message = Message::assistant(vec![
-            AssistantBlock::text("let me check"),
-            AssistantBlock::tool_call("call_1", "read_file", r#"{"path":"src/main.rs"}"#),
-            AssistantBlock::text("second"),
-        ]);
+    fn create_items() {
+        let text = Item::assistant("let me check");
+        let call = Item::tool_call(ToolCall::new(
+            "call_1",
+            "read_file",
+            r#"{"path":"src/main.rs"}"#,
+        ));
+        let result = Item::tool_result(ToolResult::new("call_1", "read_file", "fn main() {}"));
 
-        match &message {
-            Message::Assistant(blocks) => {
-                assert_eq!(blocks.len(), 3);
-                assert!(matches!(&blocks[0], AssistantBlock::Text(t) if t == "let me check"));
-                assert!(matches!(&blocks[1], AssistantBlock::ToolCall(_)));
-                assert!(matches!(&blocks[2], AssistantBlock::Text(t) if t == "second"));
-            }
-            _ => panic!("expected assistant message"),
-        }
+        assert_eq!(text.text_content(), Some("let me check"));
+        assert!(matches!(call, Item::ToolCall(_)));
+        assert!(matches!(result, Item::ToolResult(_)));
     }
 
     #[test]
-    fn create_tool_message() {
-        let call = ToolCall::new("call_1", "read_file", r#"{"path":"src/main.rs"}"#);
+    fn create_tool_result() {
         let result = ToolResult::new("call_1", "read_file", "fn main() {}");
-        let message = Message::tool(call, result);
-
-        match &message {
-            Message::Tool { call, result } => {
-                assert_eq!(call.id, "call_1");
-                assert_eq!(call.name, "read_file");
-                assert_eq!(result.content, "fn main() {}");
-                assert!(!result.is_error);
-            }
-            _ => panic!("expected tool message"),
-        }
+        assert_eq!(result.tool_call_id, "call_1");
+        assert_eq!(result.tool_name, "read_file");
+        assert_eq!(result.content, "fn main() {}");
+        assert!(!result.is_error);
     }
 
     #[test]
     fn build_request_with_tool_calls() {
         let request = ModelRequest::new(vec![
-            Message::system("You are helpful."),
-            Message::user("hello"),
-            Message::assistant(vec![
-                AssistantBlock::text("let me check"),
-                AssistantBlock::tool_call("call_1", "read_file", r#"{"path":"src/main.rs"}"#),
-            ]),
-            Message::tool(
-                ToolCall::new("call_1", "read_file", r#"{"path":"src/main.rs"}"#),
-                ToolResult::new("call_1", "read_file", "file content"),
-            ),
+            Item::system("You are helpful."),
+            Item::user("hello"),
+            Item::assistant("let me check"),
+            Item::tool_call(ToolCall::new(
+                "call_1",
+                "read_file",
+                r#"{"path":"src/main.rs"}"#,
+            )),
+            Item::tool_result(ToolResult::new("call_1", "read_file", "file content")),
         ])
         .with_tools(vec![ToolSpec::new(
             "read_file",
@@ -828,14 +869,14 @@ mod tests {
                 assert!(msg.tool_calls.is_some());
                 assert_eq!(msg.tool_calls.as_ref().map(Vec::len), Some(1));
             }
-            _ => panic!("expected assistant message"),
+            _ => panic!("expected assistant item sequence"),
         }
 
         match &payload.messages[3] {
             ChatCompletionRequestMessage::Tool(msg) => {
                 assert_eq!(msg.tool_call_id, "call_1");
             }
-            _ => panic!("expected tool message"),
+            _ => panic!("expected tool result message"),
         }
     }
 
@@ -886,19 +927,17 @@ mod tests {
         assert_eq!(parsed.finish_reason.as_deref(), Some("tool_calls"));
         assert_eq!(parsed.usage.unwrap().total_tokens, Some(15));
 
-        match &parsed.message {
-            Message::Assistant(blocks) => {
-                assert_eq!(blocks.len(), 2);
-                assert!(matches!(&blocks[0], AssistantBlock::Text(t) if t == "I will inspect the file."));
-                match &blocks[1] {
-                    AssistantBlock::ToolCall(call) => {
-                        assert_eq!(call.id, "call_1");
-                        assert_eq!(call.name, "read_file");
-                    }
-                    _ => panic!("expected tool call"),
-                }
+        assert_eq!(parsed.items.len(), 2);
+        assert!(matches!(
+            &parsed.items[0],
+            Item::Message(Message::Assistant(text)) if text == "I will inspect the file."
+        ));
+        match &parsed.items[1] {
+            Item::ToolCall(call) => {
+                assert_eq!(call.id, "call_1");
+                assert_eq!(call.name, "read_file");
             }
-            _ => panic!("expected assistant message"),
+            _ => panic!("expected tool call"),
         }
     }
 
@@ -934,7 +973,7 @@ mod tests {
                 _request: ModelRequest,
             ) -> Result<ModelResponse, ModelError> {
                 Ok(ModelResponse {
-                    message: Message::assistant_text(format!("from {model}")),
+                    items: vec![Item::assistant(format!("from {model}"))],
                     finish_reason: Some("stop".to_string()),
                     usage: None,
                 })
@@ -944,6 +983,7 @@ mod tests {
                 &self,
                 _model: &str,
                 _request: ModelRequest,
+                _cancel: CancellationToken,
             ) -> Result<ResponseStream, ModelError> {
                 let (_tx, rx) = mpsc::channel(1);
                 Ok(ResponseStream::new(rx))
@@ -955,6 +995,6 @@ mod tests {
 
         let response = runtime.block_on(model.send(ModelRequest::new(vec![])));
         let response = response.expect("send should succeed");
-        assert_eq!(response.message.text_content(), Some("from test-model"));
+        assert_eq!(response.items[0].text_content(), Some("from test-model"));
     }
 }

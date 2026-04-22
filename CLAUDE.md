@@ -8,7 +8,7 @@ A terminal AI programming assistant written in Rust.
 - **Domain objects own core logic**: Model is responsible for full message assembly; Agent only consumes domain events without redundant accumulation
 - **Single-file modules**: Each `.rs` file maps to a complete functional domain, no subdirectory splitting. File = module boundary, naming = functional boundary
 - **Domain events vs observation events**:
-  - Domain events (e.g. `MessageDone`) are the authoritative data source, carrying complete results
+  - Domain events (e.g. `ItemsDone`) are the authoritative data source, carrying complete results
   - Observation events (e.g. `TextDelta`, `ToolCallStart`) are real-time feedback for UI consumption
 
 ## Layered Responsibilities
@@ -39,4 +39,5 @@ Bus (infrastructure)  → Event broadcasting, connects Agent and UI
 - Recommended reading priority: Claude Code > Codex CLI > OpenCode
 - Reference corresponding files from reference projects as design basis (annotate with `参考:` + file path in comments)
 - Use `// === Section Name ===` comments to divide regions within files
+- **Avoid premature abstraction**: Prefer keeping logic local to the owning domain/module until at least 2-3 real call sites or a stable cross-domain concept appears. Do not create standalone `utils`/helper modules for one-off logic that is easier to understand inline.
 - **Don't avoid introducing dependencies**: Prefer mature crates from the ecosystem (e.g. `tokio_util::sync::CancellationToken`) over suboptimal solutions just to minimize dependencies. Refactoring cost is not a concern — if a better approach requires changes in multiple places, just say so

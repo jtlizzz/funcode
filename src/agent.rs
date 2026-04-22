@@ -9,11 +9,10 @@
 //! loop {
 //!     request = session.build_request(registry.specs())
 //!     stream = model.stream(request)
-//!     (blocks, usage) = consume_stream(stream)
-//!     session.push(Assistant(blocks))
+//!     (tool_calls, usage) = inline stream event loop
 //!     if 有 ToolCall {
 //!         results = execute_tools(tool_calls)
-//!         session.push(Tool { call, result })
+//!         session.push(ToolResult)
 //!         continue
 //!     } else {
 //!         break
@@ -26,12 +25,13 @@
 //! - Codex CLI `codex-rs/core/src/codex_thread.rs` — `run_turn()`
 //! - OpenCode `session/prompt.ts` — `runLoop()`
 
-use tokio::sync::watch;
+use futures_util::StreamExt;
+use tokio_util::sync::CancellationToken;
 
 use crate::bus::{Bus, Event};
 use crate::model::{
-    AssistantBlock, Message, Model, ModelError, ResponseEvent, ResponseStream, ToolCall,
-    TokenUsage, ToolResult,
+    Item, Message, Model, ModelError, ResponseEvent, ResponseStream, TokenUsage, ToolCall,
+    ToolResult,
 };
 use crate::session::Session;
 use crate::tools::ToolRegistry;
@@ -46,7 +46,9 @@ use crate::tools::ToolRegistry;
 pub enum Op {
     /// 用户发送文本消息，开始一轮新的对话。
     UserTurn(String),
-    /// 用户中断当前正在进行的模型生成或工具执行。
+    /// 用户中断当前正在进行的模型生成。
+    ///
+    /// 当前只保证中断流式模型响应；工具执行取消仍留待后续实现。
     ///
     /// 参考 Claude Code `QueryEngine.interrupt()`:
     /// `this.abortController.abort()`
@@ -63,12 +65,10 @@ pub struct Agent {
     registry: ToolRegistry,
     bus: Bus,
     max_turns: usize,
-    /// 中断信号：`true` 时 run_turn 在下一次循环检查时停止。
+    /// 中断信号：取消时 run_turn 立即停止流式消费。
     ///
-    /// 参考 Claude Code 的 `AbortController` 和 Codex 的 `CancellationToken`。
-    /// Phase 1 用 `watch::Sender<bool>` 实现，轻量且可异步检查。
-    interrupt_tx: watch::Sender<bool>,
-    interrupt_rx: watch::Receiver<bool>,
+    /// 参考 Codex CLI 的 `CancellationToken`。
+    cancel: CancellationToken,
 }
 
 impl Agent {
@@ -83,15 +83,13 @@ impl Agent {
         bus: Bus,
         max_turns: usize,
     ) -> Self {
-        let (interrupt_tx, interrupt_rx) = watch::channel(false);
         Self {
             model,
             session,
             registry,
             bus,
             max_turns,
-            interrupt_tx,
-            interrupt_rx,
+            cancel: CancellationToken::new(),
         }
     }
 
@@ -113,12 +111,12 @@ impl Agent {
     pub async fn submit(&mut self, op: Op) {
         match op {
             Op::UserTurn(text) => {
-                self.session.push(Message::user(text));
+                self.session.push(Item::user(text));
                 self.run_turn().await;
             }
             Op::Interrupt => {
-                // 参考 Claude Code: `this.abortController.abort()`
-                let _ = self.interrupt_tx.send(true);
+                // 参考 Codex CLI: `CancellationToken.cancel()`
+                self.cancel.cancel();
             }
         }
     }
@@ -132,23 +130,23 @@ impl Agent {
     /// 参考 Claude Code `query.ts` 的 `while (true)` 循环:
     /// ```ignore
     /// while (true) {
-    ///     for await (const message of deps.callModel({ messages, tools })) {
-    ///         if (tool_use blocks found) needsFollowUp = true
+    ///     for await (const item of deps.callModel({ messages, tools })) {
+    ///         if (tool_calls found) needsFollowUp = true
     ///     }
     ///     if (needsFollowUp) { execute tools; state = next; continue }
     ///     else { return { reason: 'completed' } }
     /// }
     /// ```
     async fn run_turn(&mut self) {
-        // 重置中断信号
-        let _ = self.interrupt_tx.send(false);
+        // 重置中断信号：每次新 turn 使用新的 token
+        self.cancel = CancellationToken::new();
 
         self.bus.publish(Event::TurnStarted);
 
         for turn in 0..self.max_turns {
             // 检查中断
-            if *self.interrupt_rx.borrow() {
-                self.bus.publish(Event::Error("interrupted".to_string()));
+            if self.cancel.is_cancelled() {
+                self.bus.publish(Event::TurnInterrupted);
                 return;
             }
 
@@ -159,8 +157,9 @@ impl Agent {
             let tools = self.registry.specs();
             let request = self.session.build_request(&tools);
 
-            // 流式调用模型
-            let stream = match self.model.stream(request).await {
+            // 流式调用模型（传入 cancel token）
+            let cancel = self.cancel.clone();
+            let mut stream = match self.model.stream(request, cancel).await {
                 Ok(s) => s,
                 Err(err) => {
                     self.bus.publish(Event::Error(err.to_string()));
@@ -168,32 +167,69 @@ impl Agent {
                 }
             };
 
-            // 消费流式响应
-            let (blocks, usage) = self.consume_stream(stream).await;
+            // 流式消费响应；权威完成态由 TextDone / ToolCallReady / Completed 表示。
+            let mut tool_calls = Vec::new();
+            let usage = loop {
+                let result = match stream.next().await {
+                    Some(Ok(event)) => event,
+                    Some(Err(err)) => {
+                        self.bus.publish(Event::Error(err.to_string()));
+                        return;
+                    }
+                    None => {
+                        self.bus.publish(Event::Error(
+                            ModelError::StreamProtocol("stream ended without Completed event")
+                                .to_string(),
+                        ));
+                        return;
+                    }
+                };
 
-            // 记录 assistant 消息和 token 使用
-            self.session.push(Message::assistant(blocks.clone()));
+                match result {
+                    ResponseEvent::TextDelta(delta) => {
+                        self.bus.publish(Event::TextDelta(delta));
+                    }
+                    ResponseEvent::ToolCallStart { id, name } => {
+                        self.bus.publish(Event::ToolCallBegin {
+                            id: id.clone(),
+                            name: name.clone(),
+                        });
+                    }
+                    ResponseEvent::ToolCallReady {
+                        id,
+                        name,
+                        arguments,
+                    } => {
+                        let call = ToolCall::new(id, name, arguments);
+                        self.session.push(Item::tool_call(call.clone()));
+                        tool_calls.push(call);
+                    }
+                    ResponseEvent::Cancelled => {
+                        self.bus.publish(Event::TurnInterrupted);
+                        return;
+                    }
+                    ResponseEvent::TextDone(text) => {
+                        self.session.push(Item::assistant(text.clone()));
+                        self.bus.publish(Event::TextDone(text));
+                    }
+                    ResponseEvent::Completed {
+                        usage,
+                        finish_reason: _,
+                    } => {
+                        break usage;
+                    }
+                }
+            };
+
+            // 正常完成：记录 token 使用
             if let Some(u) = usage {
                 self.session.record_usage(u);
             }
 
-            // 提取工具调用
-            let tool_calls: Vec<&ToolCall> = blocks
-                .iter()
-                .filter_map(|b| match b {
-                    AssistantBlock::ToolCall(tc) => Some(tc),
-                    _ => None,
-                })
-                .collect();
-
             if tool_calls.is_empty() {
                 // 无工具调用 → 正常完成
-                // 参考 Claude Code: `return { reason: 'completed', turnCount }`
-                // 参考 Codex CLI: `if !needs_follow_up { break }`
                 let final_usage = usage;
-                self.bus.publish(Event::TurnComplete {
-                    usage: final_usage,
-                });
+                self.bus.publish(Event::TurnComplete { usage: final_usage });
                 return;
             }
 
@@ -201,113 +237,31 @@ impl Agent {
             let results = self.execute_tools(&tool_calls).await;
 
             // 将工具结果推入 session
-            for (call, result) in results {
-                self.session.push(Message::tool(call, result));
+            for result in results {
+                self.session.push(Item::tool_result(result));
             }
 
             // 继续下一轮（模型将看到工具结果并决定下一步）
-            // 参考 Claude Code:
-            // `state = { messages: [...messages, ...toolResults] }`
             let _ = turn; // turn 仅用于 max_turns 计数
         }
 
         // 超过 max_turns
-        // 参考 Claude Code: `return { reason: 'max_turns', turnCount }`
         self.bus.publish(Event::Error(format!(
             "max turns reached ({})",
             self.max_turns
         )));
     }
 
-    // ==================== 流式消费 ====================
-
-    /// 消费模型流式响应，实时推送事件到 Bus。
-    ///
-    /// 返回收集到的完整 `AssistantBlock` 列表和 token usage。
-    ///
-    /// 参考:
-    /// - Claude Code `query.ts`: `for await (const message of deps.callModel())`
-    /// - Codex CLI `try_run_sampling_request`: 逐 SSE 事件 match
-    /// - OpenCode `processor.ts` `handleEvent`: 按 type 分发
-    async fn consume_stream(
-        &mut self,
-        mut stream: ResponseStream,
-    ) -> (Vec<AssistantBlock>, Option<TokenUsage>) {
-        use futures_util::StreamExt;
-
-        let mut text = String::new();
-        let mut tool_calls: Vec<ToolCall> = Vec::new();
-        let mut usage = None;
-
-        while let Some(result) = stream.next().await {
-            // 检查中断
-            if *self.interrupt_rx.borrow() {
-                break;
-            }
-
-            let event = match result {
-                Ok(e) => e,
-                Err(err) => {
-                    self.bus.publish(Event::Error(err.to_string()));
-                    break;
-                }
-            };
-
-            match event {
-                ResponseEvent::TextDelta(delta) => {
-                    // 参考 Codex CLI: `emit_streamed_assistant_text_delta()`
-                    text.push_str(&delta);
-                    self.bus.publish(Event::TextDelta(delta));
-                }
-                ResponseEvent::ToolCallStart { id, name } => {
-                    // UI 提示：模型开始提及一个工具调用
-                    // 参考 Claude Code `StreamingToolExecutor.addTool()`
-                    self.bus.publish(Event::ToolCallBegin {
-                        id: id.clone(),
-                        name: name.clone(),
-                    });
-                }
-                ResponseEvent::ToolCallReady {
-                    id,
-                    name,
-                    arguments,
-                } => {
-                    // 参数接收完毕，工具准备好执行
-                    tool_calls.push(ToolCall::new(id, name, arguments));
-                }
-                ResponseEvent::MessageDone(response) => {
-                    // 整条消息完成
-                    // 参考 Claude Code: 从 response 提取 usage 和 finish_reason
-                    if let Some(u) = response.usage {
-                        usage = Some(u);
-                    }
-                }
-            }
-        }
-
-        // 组装 blocks
-        let mut blocks = Vec::new();
-        if !text.is_empty() {
-            blocks.push(AssistantBlock::text(&text));
-            self.bus.publish(Event::TextDone(text));
-        }
-        for tc in tool_calls {
-            blocks.push(AssistantBlock::ToolCall(tc));
-        }
-
-        (blocks, usage)
-    }
-
     // ==================== 工具执行 ====================
 
-    /// 执行工具调用列表，返回 (ToolCall, ToolResult) 对。
+    /// 执行工具调用列表，返回 `ToolResult` 列表。
     ///
     /// Phase 1 串行执行。Phase 2 加入 `is_concurrency_safe` 分区并行。
     ///
     /// 参考:
     /// - Claude Code `toolOrchestration.ts`: `runToolsSerially()`
     /// - Codex CLI: `FuturesOrdered` 并行执行
-    async fn execute_tools(&self, calls: &[&ToolCall]) -> Vec<(ToolCall, ToolResult)> {
+    async fn execute_tools(&self, calls: &[ToolCall]) -> Vec<ToolResult> {
         let mut results = Vec::with_capacity(calls.len());
 
         for call in calls {
@@ -323,7 +277,7 @@ impl Agent {
                 is_error: result.is_error,
             });
 
-            results.push(((*call).clone(), result));
+            results.push(result);
         }
 
         results
@@ -335,7 +289,7 @@ impl Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ModelProvider, ModelRequest, ModelResponse};
+    use crate::model::{ModelError, ModelProvider, ModelRequest, ModelResponse};
     use crate::tools::Tool;
     use async_trait::async_trait;
     use serde_json::json;
@@ -355,7 +309,7 @@ mod tests {
             _request: ModelRequest,
         ) -> Result<ModelResponse, ModelError> {
             Ok(ModelResponse {
-                message: Message::assistant_text(&self.response),
+                items: vec![Item::assistant(&self.response)],
                 finish_reason: Some("stop".to_string()),
                 usage: Some(TokenUsage {
                     input_tokens: Some(10),
@@ -369,6 +323,7 @@ mod tests {
             &self,
             _model: &str,
             _request: ModelRequest,
+            _cancel: CancellationToken,
         ) -> Result<ResponseStream, ModelError> {
             let (tx, rx) = tokio::sync::mpsc::channel(32);
 
@@ -376,15 +331,17 @@ mod tests {
             tokio::spawn(async move {
                 let _ = tx.send(Ok(ResponseEvent::TextDelta(text.clone()))).await;
                 let _ = tx
-                    .send(Ok(ResponseEvent::MessageDone(ModelResponse {
-                        message: Message::assistant_text(&text),
+                    .send(Ok(ResponseEvent::TextDone(text)))
+                    .await;
+                let _ = tx
+                    .send(Ok(ResponseEvent::Completed {
                         finish_reason: Some("stop".to_string()),
                         usage: Some(TokenUsage {
                             input_tokens: Some(10),
                             output_tokens: Some(5),
                             total_tokens: Some(15),
                         }),
-                    })))
+                    }))
                     .await;
             });
 
@@ -403,7 +360,7 @@ mod tests {
             _request: ModelRequest,
         ) -> Result<ModelResponse, ModelError> {
             Ok(ModelResponse {
-                message: Message::assistant_text("done"),
+                items: vec![Item::assistant("done")],
                 finish_reason: Some("stop".to_string()),
                 usage: None,
             })
@@ -413,6 +370,7 @@ mod tests {
             &self,
             _model: &str,
             _request: ModelRequest,
+            _cancel: CancellationToken,
         ) -> Result<ResponseStream, ModelError> {
             let (tx, rx) = tokio::sync::mpsc::channel(32);
             tokio::spawn(async move {
@@ -430,20 +388,125 @@ mod tests {
                     }))
                     .await;
                 let _ = tx
-                    .send(Ok(ResponseEvent::MessageDone(ModelResponse {
-                        message: Message::assistant(vec![AssistantBlock::tool_call(
-                            "call_1",
-                            "echo",
-                            r#"{"message":"hello"}"#,
-                        )]),
+                    .send(Ok(ResponseEvent::Completed {
                         finish_reason: Some("tool_calls".to_string()),
                         usage: Some(TokenUsage {
                             input_tokens: Some(50),
                             output_tokens: Some(20),
                             total_tokens: Some(70),
                         }),
-                    })))
+                    }))
                     .await;
+            });
+            Ok(ResponseStream::new(rx))
+        }
+    }
+
+    /// Mock provider: 发送一个 TextDelta 后自行取消 token（模拟外部中断）。
+    struct SlowProvider;
+
+    #[async_trait]
+    impl ModelProvider for SlowProvider {
+        async fn send(
+            &self,
+            _model: &str,
+            _request: ModelRequest,
+        ) -> Result<ModelResponse, ModelError> {
+            Ok(ModelResponse {
+                items: vec![Item::assistant("slow")],
+                finish_reason: Some("stop".to_string()),
+                usage: None,
+            })
+        }
+
+        async fn stream(
+            &self,
+            _model: &str,
+            _request: ModelRequest,
+            cancel: CancellationToken,
+        ) -> Result<ResponseStream, ModelError> {
+            let (tx, rx) = tokio::sync::mpsc::channel(32);
+            // Provider 持有 cancel 的 clone，发送 TextDelta 后自行取消
+            // 模拟"用户在流式输出过程中按下中断"的场景
+            let cancel_trigger = cancel.clone();
+            tokio::spawn(async move {
+                let _ = tx
+                    .send(Ok(ResponseEvent::TextDelta("partial".to_string())))
+                    .await;
+                cancel_trigger.cancel();
+                let _ = tx.send(Ok(ResponseEvent::Cancelled)).await;
+            });
+            Ok(ResponseStream::new(rx))
+        }
+    }
+
+    /// Mock provider: 流意外结束，不发送任何终态事件。
+    struct MissingTerminalProvider;
+
+    #[async_trait]
+    impl ModelProvider for MissingTerminalProvider {
+        async fn send(
+            &self,
+            _model: &str,
+            _request: ModelRequest,
+        ) -> Result<ModelResponse, ModelError> {
+            unreachable!("stream-only test provider")
+        }
+
+        async fn stream(
+            &self,
+            _model: &str,
+            _request: ModelRequest,
+            _cancel: CancellationToken,
+        ) -> Result<ResponseStream, ModelError> {
+            let (tx, rx) = tokio::sync::mpsc::channel(32);
+            tokio::spawn(async move {
+                let _ = tx
+                    .send(Ok(ResponseEvent::TextDelta("partial".to_string())))
+                    .await;
+            });
+            Ok(ResponseStream::new(rx))
+        }
+    }
+
+    /// Mock provider: 先产出完成态事件，再发生晚到取消。
+    struct LateCancelAfterDoneProvider;
+
+    #[async_trait]
+    impl ModelProvider for LateCancelAfterDoneProvider {
+        async fn send(
+            &self,
+            _model: &str,
+            _request: ModelRequest,
+        ) -> Result<ModelResponse, ModelError> {
+            unreachable!("stream-only test provider")
+        }
+
+        async fn stream(
+            &self,
+            _model: &str,
+            _request: ModelRequest,
+            cancel: CancellationToken,
+        ) -> Result<ResponseStream, ModelError> {
+            let (tx, rx) = tokio::sync::mpsc::channel(32);
+            tokio::spawn(async move {
+                let _ = tx
+                    .send(Ok(ResponseEvent::TextDelta("done".to_string())))
+                    .await;
+                let _ = tx
+                    .send(Ok(ResponseEvent::TextDone("done".to_string())))
+                    .await;
+                let _ = tx
+                    .send(Ok(ResponseEvent::Completed {
+                        finish_reason: Some("stop".to_string()),
+                        usage: Some(TokenUsage {
+                            input_tokens: Some(1),
+                            output_tokens: Some(1),
+                            total_tokens: Some(2),
+                        }),
+                    }))
+                    .await;
+                cancel.cancel();
             });
             Ok(ResponseStream::new(rx))
         }
@@ -509,36 +572,37 @@ mod tests {
         assert!(events.contains(&Event::TurnStarted));
         assert!(events.contains(&Event::TextDelta("Hello world".to_string())));
         assert!(events.contains(&Event::TextDone("Hello world".to_string())));
-        assert!(matches!(
-            &events[3],
-            Event::TurnComplete { usage: Some(_) }
-        ));
+        assert!(matches!(&events[3], Event::TurnComplete { usage: Some(_) }));
 
-        // session 应该有 2 条消息: user + assistant
+        // session 应该有 2 个 item: user + assistant
         assert_eq!(agent.session().len(), 2);
         assert_eq!(agent.session().total_tokens(), 15);
     }
 
     #[tokio::test]
-    async fn interrupt_signal_works() {
+    async fn cancel_token_works() {
         let mut agent = text_agent("response");
 
-        // 中断信号默认为 false
-        assert!(!*agent.interrupt_rx.borrow());
+        // cancel 默认未取消
+        assert!(!agent.cancel.is_cancelled());
 
         // 发送中断
         agent.submit(Op::Interrupt).await;
-        assert!(*agent.interrupt_rx.borrow());
+        assert!(agent.cancel.is_cancelled());
 
-        // 正常 submit 会重置中断信号并正常完成
+        // 正常 submit 会重置 cancel token 并正常完成
         let mut sub = agent.bus().subscribe();
         agent.submit(Op::UserTurn("hi".to_string())).await;
 
         // 重置后应该正常完成
-        assert!(!*agent.interrupt_rx.borrow());
+        assert!(!agent.cancel.is_cancelled());
         let events = collect_events(&mut sub, 4).await;
         assert!(events.contains(&Event::TurnStarted));
-        assert!(events.iter().any(|e| matches!(e, Event::TurnComplete { .. })));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::TurnComplete { .. }))
+        );
     }
 
     #[tokio::test]
@@ -557,8 +621,8 @@ mod tests {
 
         // max_turns=2，ToolCallProvider 每次都返回工具调用
         // 应该在 2 轮后因 max_turns 停止
-        let messages = agent.session().messages();
-        assert!(messages.len() >= 3);
+        let items = agent.session().items();
+        assert!(items.len() >= 3);
     }
 
     #[tokio::test]
@@ -575,17 +639,17 @@ mod tests {
 
         agent.submit(Op::UserTurn("use echo".to_string())).await;
 
-        let msgs = agent.session().messages();
-        // user + assistant(tool_call) + tool_result
+        let msgs = agent.session().items();
+        // user + tool_call + tool_result
         assert_eq!(msgs.len(), 3);
 
         match &msgs[2] {
-            Message::Tool { call, result } => {
-                assert_eq!(call.name, "echo");
+            Item::ToolResult(result) => {
+                assert_eq!(result.tool_name, "echo");
                 assert!(!result.is_error);
                 assert!(result.content.contains("hello"));
             }
-            _ => panic!("expected Tool message"),
+            _ => panic!("expected ToolResult item"),
         }
     }
 
@@ -614,5 +678,92 @@ mod tests {
             e,
             Event::ToolCallEnd { name, is_error: false, .. } if name == "echo"
         )));
+    }
+
+    #[tokio::test]
+    async fn mid_stream_interrupt_skips_session_push() {
+        let model = Model::new(Box::new(SlowProvider), "test-model").unwrap();
+        let session = Session::new("system", 100_000);
+        let registry = ToolRegistry::new();
+        let bus = Bus::new(64);
+        let mut agent = Agent::new(model, session, registry, bus, 10);
+        let mut sub = agent.bus().subscribe();
+
+        // SlowProvider 发送一个 TextDelta 后自行取消 token
+        // 模拟"流式输出过程中被中断"的场景
+        agent
+            .submit(Op::UserTurn("test interrupt".to_string()))
+            .await;
+
+        let events = collect_events(&mut sub, 5).await;
+
+        // 应该收到 TurnStarted 和 TurnInterrupted
+        assert!(events.contains(&Event::TurnStarted));
+        assert!(events.iter().any(|e| matches!(e, Event::TurnInterrupted)));
+
+        // 不应该收到 TurnComplete
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::TurnComplete { .. }))
+        );
+
+        // session 不应该包含半截 assistant item
+        // 只有 user item
+        assert_eq!(agent.session().len(), 1);
+        assert!(matches!(
+            agent.session().items()[0],
+            Item::Message(Message::User(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn eof_without_terminal_event_reports_protocol_error() {
+        let model = Model::new(Box::new(MissingTerminalProvider), "test-model").unwrap();
+        let session = Session::new("system", 100_000);
+        let registry = ToolRegistry::new();
+        let bus = Bus::new(64);
+        let mut agent = Agent::new(model, session, registry, bus, 10);
+        let mut sub = agent.bus().subscribe();
+
+        agent.submit(Op::UserTurn("test eof".to_string())).await;
+
+        let events = collect_events(&mut sub, 5).await;
+        assert!(events.contains(&Event::TurnStarted));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Event::Error(msg) if msg == "stream protocol error: stream ended without Completed event")));
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::TurnComplete { .. }))
+        );
+        assert_eq!(agent.session().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn buffered_message_done_wins_over_late_cancel() {
+        let model = Model::new(Box::new(LateCancelAfterDoneProvider), "test-model").unwrap();
+        let session = Session::new("system", 100_000);
+        let registry = ToolRegistry::new();
+        let bus = Bus::new(64);
+        let mut agent = Agent::new(model, session, registry, bus, 10);
+        let mut sub = agent.bus().subscribe();
+
+        agent
+            .submit(Op::UserTurn("test late cancel".to_string()))
+            .await;
+
+        let events = collect_events(&mut sub, 5).await;
+        assert!(events.contains(&Event::TurnStarted));
+        assert!(events.contains(&Event::TextDelta("done".to_string())));
+        assert!(events.contains(&Event::TextDone("done".to_string())));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::TurnComplete { .. }))
+        );
+        assert!(!events.iter().any(|e| matches!(e, Event::TurnInterrupted)));
+        assert_eq!(agent.session().len(), 2);
     }
 }

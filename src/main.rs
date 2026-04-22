@@ -6,19 +6,19 @@
 //! - 启动 CLI/TUI 主循环
 //! - 把顶层控制权交给 `app` 模块
 
-mod bus;
+mod agent;
 mod app;
+mod approval;
+mod bus;
 mod cli;
 mod config;
-mod agent;
 mod context;
-mod session;
-mod model;
-mod tools;
-mod shell;
 mod fs;
 mod git;
-mod approval;
+mod model;
+mod session;
+mod shell;
+mod tools;
 
 fn main() {
     // 模块骨架阶段暂不放具体启动逻辑。
