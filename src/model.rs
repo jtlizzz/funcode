@@ -206,7 +206,7 @@ pub enum ResponseEvent {
         id: String,
         name: String,
     },
-    ToolCallDone {
+    ToolCallReady {
         id: String,
         name: String,
         arguments: String,
@@ -220,7 +220,7 @@ pub struct ResponseStream {
 }
 
 impl ResponseStream {
-    fn new(rx_event: mpsc::Receiver<Result<ResponseEvent, ModelError>>) -> Self {
+    pub fn new(rx_event: mpsc::Receiver<Result<ResponseEvent, ModelError>>) -> Self {
         Self { rx_event }
     }
 }
@@ -447,7 +447,7 @@ impl ModelProvider for OpenAIProvider {
                 }
             }
 
-            // Stream ended — emit ToolCallDone + MessageDone
+            // Stream ended — emit ToolCallReady + MessageDone
             let mut blocks = Vec::new();
             if !text.is_empty() {
                 blocks.push(AssistantBlock::Text(text));
@@ -476,7 +476,7 @@ impl ModelProvider for OpenAIProvider {
                     }
                 };
                 if tx_event
-                    .send(Ok(ResponseEvent::ToolCallDone {
+                    .send(Ok(ResponseEvent::ToolCallReady {
                         id: id.clone(),
                         name: name.clone(),
                         arguments: call.arguments.clone(),

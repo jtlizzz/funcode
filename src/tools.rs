@@ -8,9 +8,8 @@
 //! - 组织工具执行结果回传给 Agent
 
 use std::collections::HashMap;
-use std::future::Future;
-use std::pin::Pin;
 
+use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::model::{ToolResult, ToolSpec};
@@ -33,10 +32,8 @@ pub enum ToolError {
 
 // ==================== Tool 特征 ====================
 
-/// 异步工具执行的未来类型。
-type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
-
 /// 工具特征，所有具体工具必须实现此接口。
+#[async_trait]
 pub trait Tool: Send + Sync {
     /// 工具名称，需全局唯一。
     fn name(&self) -> &str;
@@ -48,7 +45,7 @@ pub trait Tool: Send + Sync {
     fn input_schema(&self) -> Value;
 
     /// 执行工具调用，返回结果内容字符串。
-    fn execute(&self, arguments: &str) -> BoxFuture<Result<String, ToolError>>;
+    async fn execute(&self, arguments: &str) -> Result<String, ToolError>;
 
     /// 生成供模型使用的工具定义。
     fn spec(&self) -> ToolSpec {
@@ -137,6 +134,7 @@ mod tests {
     /// 测试用工具：回显输入参数。
     struct EchoTool;
 
+    #[async_trait]
     impl Tool for EchoTool {
         fn name(&self) -> &str {
             "echo"
@@ -156,22 +154,20 @@ mod tests {
             })
         }
 
-        fn execute(&self, arguments: &str) -> BoxFuture<Result<String, ToolError>> {
-            let args = arguments.to_string();
-            Box::pin(async move {
-                let _: Value = serde_json::from_str(&args)
-                    .map_err(|e| ToolError::InvalidArguments {
-                        name: "echo".to_string(),
-                        reason: e.to_string(),
-                    })?;
-                Ok(args)
-            })
+        async fn execute(&self, arguments: &str) -> Result<String, ToolError> {
+            let _: Value = serde_json::from_str(arguments)
+                .map_err(|e| ToolError::InvalidArguments {
+                    name: "echo".to_string(),
+                    reason: e.to_string(),
+                })?;
+            Ok(arguments.to_string())
         }
     }
 
     /// 测试用工具：总是执行失败。
     struct FailTool;
 
+    #[async_trait]
     impl Tool for FailTool {
         fn name(&self) -> &str {
             "fail"
@@ -185,10 +181,8 @@ mod tests {
             json!({"type": "object", "properties": {}})
         }
 
-        fn execute(&self, _arguments: &str) -> BoxFuture<Result<String, ToolError>> {
-            Box::pin(async {
-                Err(ToolError::Execution("intentional failure".to_string()))
-            })
+        async fn execute(&self, _arguments: &str) -> Result<String, ToolError> {
+            Err(ToolError::Execution("intentional failure".to_string()))
         }
     }
 
