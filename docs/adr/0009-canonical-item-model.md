@@ -5,6 +5,31 @@
 
 ## 背景
 
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User as User
+    participant UI as REPL / useCancelRequest
+    participant Abort as AbortController
+    participant Query as query.ts
+    participant Exec as StreamingToolExecutor
+    participant Tool as Tool / Shell
+    participant Hist as Message History / UI
+
+    User->>UI: Esc / Ctrl+C / submit new message
+    UI->>UI: 判断是 user-cancel 还是 interrupt
+    UI->>Hist: 保留 partial assistant text
+    UI->>Abort: abort(reason)
+    Abort-->>Query: signal.aborted = true
+    Query->>Exec: 读取剩余 tool 结果 / 补 synthetic tool_result
+    Exec->>Tool: 视 interruptBehavior 决定是否取消
+    Tool-->>Exec: 已中断 / 保留部分输出 / 拒绝执行
+    Exec-->>Query: synthetic tool_result / error result
+    Query->>Hist: 插入 [Request interrupted by user]
+    Query-->>UI: 本轮以 aborted_streaming / aborted_tools 结束
+    UI->>UI: 清 loading / 清队列 / 等待下一次输入
+```
+
 当前 `src/model.rs` 采用如下内部模型：
 
 ```rust
