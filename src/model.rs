@@ -494,7 +494,11 @@ impl ModelProvider for OpenAIProvider {
 
             // Stream ended — emit completed domain events, then a terminal Completed.
             if !text.is_empty() {
-                if tx_event.send(Ok(ResponseEvent::TextDone(text))).await.is_err() {
+                if tx_event
+                    .send(Ok(ResponseEvent::TextDone(text)))
+                    .await
+                    .is_err()
+                {
                     return;
                 }
             }

@@ -188,9 +188,15 @@ mod tests {
     async fn list_dir_returns_entries() {
         let dir = TempDir::new();
 
-        FileSystem::write_file(&dir.path().join("a.txt"), "a").await.unwrap();
-        FileSystem::write_file(&dir.path().join("b.txt"), "b").await.unwrap();
-        FileSystem::create_dir_all(&dir.path().join("subdir")).await.unwrap();
+        FileSystem::write_file(&dir.path().join("a.txt"), "a")
+            .await
+            .unwrap();
+        FileSystem::write_file(&dir.path().join("b.txt"), "b")
+            .await
+            .unwrap();
+        FileSystem::create_dir_all(&dir.path().join("subdir"))
+            .await
+            .unwrap();
 
         let entries = FileSystem::list_dir(dir.path()).await.unwrap();
         assert_eq!(entries.len(), 3);

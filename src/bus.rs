@@ -54,6 +54,7 @@ pub enum Event {
 ///
 /// 内部使用 `broadcast` channel，每个订阅者拥有独立的消费游标。
 /// 慢消费者会收到 `Lagged` 通知并丢弃中间事件。
+#[derive(Clone)]
 pub struct Bus {
     tx: broadcast::Sender<Event>,
 }

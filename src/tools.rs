@@ -14,6 +14,7 @@ use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 use crate::model::{ToolResult, ToolSpec};
 
@@ -43,10 +44,35 @@ pub fn parse_arguments<T>(arguments: &str, tool_name: &str) -> Result<T, ToolErr
 where
     T: for<'de> Deserialize<'de>,
 {
-    serde_json::from_str(arguments).map_err(|err| ToolError::Arguments(format!("{tool_name}: {err}")))
+    serde_json::from_str(arguments)
+        .map_err(|err| ToolError::Arguments(format!("{tool_name}: {err}")))
 }
 
 // ==================== Tool 特征 ====================
+
+/// 工具执行上下文。
+///
+/// 参考:
+/// - Claude Code `src/utils/forkedAgent.ts` — `createSubagentContext()`
+/// - Codex CLI `codex-rs/core/src/codex_delegate.rs` — child `CancellationToken`
+///
+/// 当前只携带取消信号；后续可非破坏性扩展 Bus、cwd、权限策略和 AgentFactory。
+#[derive(Clone)]
+pub struct ToolContext {
+    pub cancel: CancellationToken,
+}
+
+impl ToolContext {
+    pub fn new(cancel: CancellationToken) -> Self {
+        Self { cancel }
+    }
+}
+
+impl Default for ToolContext {
+    fn default() -> Self {
+        Self::new(CancellationToken::new())
+    }
+}
 
 /// 从实现了 `JsonSchema` 的类型自动生成精简 JSON Schema。
 ///
@@ -66,7 +92,9 @@ pub fn schema_for<T: JsonSchema>() -> Value {
 
 /// 移除模型调用不需要的冗余 schema 字段。
 fn clean_schema(value: &mut Value) {
-    let Some(obj) = value.as_object_mut() else { return };
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
     obj.remove("title");
     obj.remove("description");
 
@@ -93,7 +121,7 @@ pub trait Tool: Send + Sync {
     fn parameters(&self) -> Value;
 
     /// 执行工具调用，返回结果内容字符串。
-    async fn execute(&self, arguments: &str) -> Result<String, ToolError>;
+    async fn execute(&self, arguments: &str, context: ToolContext) -> Result<String, ToolError>;
 
     /// 生成供模型使用的工具定义。
     fn spec(&self) -> ToolSpec {
@@ -155,6 +183,21 @@ impl ToolRegistry {
         tool_name: &str,
         arguments: &str,
     ) -> ToolResult {
+        self.execute_with_context(tool_call_id, tool_name, arguments, ToolContext::default())
+            .await
+    }
+
+    /// 使用显式上下文执行一次工具调用。
+    ///
+    /// Agent 主循环使用此入口传入当前 turn 的取消信号；测试和简单调用可继续使用
+    /// [`ToolRegistry::execute`] 的默认上下文。
+    pub async fn execute_with_context(
+        &self,
+        tool_call_id: impl Into<String>,
+        tool_name: &str,
+        arguments: &str,
+        context: ToolContext,
+    ) -> ToolResult {
         let tool_call_id = tool_call_id.into();
 
         let Some(tool) = self.tools.get(tool_name) else {
@@ -165,7 +208,7 @@ impl ToolRegistry {
             );
         };
 
-        match tool.execute(arguments).await {
+        match tool.execute(arguments, context).await {
             Ok(content) => ToolResult::new(tool_call_id, tool_name, content),
             Err(err) => ToolResult::error(tool_call_id, tool_name, err.to_string()),
         }
@@ -211,7 +254,7 @@ impl Tool for FileReadTool {
         schema_for::<FileReadInput>()
     }
 
-    async fn execute(&self, arguments: &str) -> Result<String, ToolError> {
+    async fn execute(&self, arguments: &str, _context: ToolContext) -> Result<String, ToolError> {
         let args: FileReadInput = parse_arguments(arguments, "Read")?;
 
         let path = Path::new(&args.file_path);
@@ -273,7 +316,7 @@ impl Tool for FileEditTool {
         schema_for::<FileEditInput>()
     }
 
-    async fn execute(&self, arguments: &str) -> Result<String, ToolError> {
+    async fn execute(&self, arguments: &str, _context: ToolContext) -> Result<String, ToolError> {
         let args: FileEditInput = parse_arguments(arguments, "Edit")?;
 
         if args.old_string == args.new_string {
@@ -289,7 +332,9 @@ impl Tool for FileEditTool {
         let (new_content, count) = if replace_all {
             let count = content.matches(&args.old_string).count();
             if count == 0 {
-                return Err(ToolError::Execution("old_string not found in file".to_string()));
+                return Err(ToolError::Execution(
+                    "old_string not found in file".to_string(),
+                ));
             }
             (content.replace(&args.old_string, &args.new_string), count)
         } else {
@@ -298,7 +343,7 @@ impl Tool for FileEditTool {
                 None => {
                     return Err(ToolError::Execution(
                         "old_string not found in file".to_string(),
-                    ))
+                    ));
                 }
             }
         };
@@ -318,7 +363,9 @@ impl Tool for FileEditTool {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct FileWriteInput {
     /// 文件的绝对路径。
-    #[schemars(description = "The absolute path to the file to write (must be absolute, not relative)")]
+    #[schemars(
+        description = "The absolute path to the file to write (must be absolute, not relative)"
+    )]
     pub file_path: String,
     /// 要写入的内容。
     #[schemars(description = "The content to write to the file")]
@@ -348,7 +395,7 @@ impl Tool for FileWriteTool {
         schema_for::<FileWriteInput>()
     }
 
-    async fn execute(&self, arguments: &str) -> Result<String, ToolError> {
+    async fn execute(&self, arguments: &str, _context: ToolContext) -> Result<String, ToolError> {
         let args: FileWriteInput = parse_arguments(arguments, "Write")?;
 
         let path = Path::new(&args.file_path);
@@ -371,7 +418,9 @@ impl Tool for FileWriteTool {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GlobInput {
     /// Glob 匹配模式。
-    #[schemars(description = "The glob pattern to match files against (e.g. \"**/*.rs\", \"src/**/*.ts\")")]
+    #[schemars(
+        description = "The glob pattern to match files against (e.g. \"**/*.rs\", \"src/**/*.ts\")"
+    )]
     pub pattern: String,
     /// 搜索的目录路径。
     #[schemars(description = "The directory to search in")]
@@ -401,7 +450,7 @@ impl Tool for GlobTool {
         schema_for::<GlobInput>()
     }
 
-    async fn execute(&self, arguments: &str) -> Result<String, ToolError> {
+    async fn execute(&self, arguments: &str, _context: ToolContext) -> Result<String, ToolError> {
         let args: GlobInput = parse_arguments(arguments, "Glob")?;
 
         let matcher = globset::GlobBuilder::new(&args.pattern)
@@ -412,7 +461,10 @@ impl Tool for GlobTool {
 
         let base = PathBuf::from(&args.path);
         if !base.exists() {
-            return Err(ToolError::Execution(format!("path does not exist: {}", args.path)));
+            return Err(ToolError::Execution(format!(
+                "path does not exist: {}",
+                args.path
+            )));
         }
 
         let results = tokio::task::spawn_blocking(move || {
@@ -422,10 +474,7 @@ impl Tool for GlobTool {
                     Ok(e) => e,
                     Err(_) => continue,
                 };
-                let relative = entry
-                    .path()
-                    .strip_prefix(&base)
-                    .unwrap_or(entry.path());
+                let relative = entry.path().strip_prefix(&base).unwrap_or(entry.path());
                 if matcher.is_match(relative) {
                     matched.push(entry.path().display().to_string());
                 }
@@ -482,7 +531,7 @@ impl Tool for BashTool {
         schema_for::<BashInput>()
     }
 
-    async fn execute(&self, arguments: &str) -> Result<String, ToolError> {
+    async fn execute(&self, arguments: &str, _context: ToolContext) -> Result<String, ToolError> {
         let args: BashInput = parse_arguments(arguments, "Bash")?;
 
         let timeout_secs = args.timeout.unwrap_or(120);
@@ -492,18 +541,16 @@ impl Tool for BashTool {
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
-        let output = tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_secs),
-            cmd.output(),
-        )
-        .await
-        .map_err(|_| {
-            ToolError::Execution(format!(
-                "command timed out after {} seconds",
-                timeout_secs
-            ))
-        })?
-        .map_err(ToolError::from)?;
+        let output =
+            tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), cmd.output())
+                .await
+                .map_err(|_| {
+                    ToolError::Execution(format!(
+                        "command timed out after {} seconds",
+                        timeout_secs
+                    ))
+                })?
+                .map_err(ToolError::from)?;
 
         let mut result = String::new();
 
@@ -566,7 +613,11 @@ mod tests {
             schema_for::<EchoInput>()
         }
 
-        async fn execute(&self, arguments: &str) -> Result<String, ToolError> {
+        async fn execute(
+            &self,
+            arguments: &str,
+            _context: ToolContext,
+        ) -> Result<String, ToolError> {
             let _: EchoInput = parse_arguments(arguments, "echo")?;
             Ok(arguments.to_string())
         }
@@ -588,7 +639,11 @@ mod tests {
             schema_for::<EchoInput>()
         }
 
-        async fn execute(&self, _arguments: &str) -> Result<String, ToolError> {
+        async fn execute(
+            &self,
+            _arguments: &str,
+            _context: ToolContext,
+        ) -> Result<String, ToolError> {
             Err(ToolError::Execution("intentional failure".to_string()))
         }
     }
@@ -688,6 +743,48 @@ mod tests {
         assert_eq!(result.tool_call_id, "call_3");
         assert!(result.is_error);
         assert!(result.content.contains("invalid arguments"));
+    }
+
+    struct ContextAwareTool;
+
+    #[async_trait]
+    impl Tool for ContextAwareTool {
+        fn name(&self) -> &str {
+            "context_aware"
+        }
+
+        fn description(&self) -> &str {
+            "Reads tool execution context"
+        }
+
+        fn parameters(&self) -> Value {
+            json!({"type": "object"})
+        }
+
+        async fn execute(
+            &self,
+            _arguments: &str,
+            context: ToolContext,
+        ) -> Result<String, ToolError> {
+            Ok(format!("cancelled={}", context.cancel.is_cancelled()))
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_passes_tool_context_to_tool() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(ContextAwareTool));
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+
+        let result = registry
+            .execute_with_context("call_4", "context_aware", "{}", ToolContext::new(cancel))
+            .await;
+
+        assert_eq!(result.tool_call_id, "call_4");
+        assert!(!result.is_error);
+        assert_eq!(result.content, "cancelled=true");
     }
 
     // ---- 参数解析测试 ----

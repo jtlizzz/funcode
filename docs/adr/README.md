@@ -5,7 +5,7 @@
 | [0001](0001-unified-message-model.md) | Unified message model with role-specific enum | superseded by ADR-0009 | 2026-04-25 |
 | [0002](0002-model-provider-trait.md) | ModelProvider trait with dynamic dispatch | accepted | 2026-04-25 |
 | [0003](0003-event-bus-broadcast.md) | Event bus with broadcast channel for Agent-CLI decoupling | accepted | 2026-04-25 |
-| [0004](0004-unified-op-enum.md) | Unified Op enum as Agent entry point | accepted | 2026-04-25 |
+| [0004](0004-unified-op-enum.md) | Minimal Op enum as Agent turn entry point | accepted | 2026-04-25 |
 | [0005](0005-stateless-session.md) | Stateless session with full-history rebuild | accepted | 2026-04-25 |
 | [0006](0006-token-budget-truncation.md) | Heuristic token budget truncation with last-user preservation | accepted | 2026-04-25 |
 | [0007](0007-tool-trait-boxfuture.md) | Tool trait with `#[async_trait]` | accepted | 2026-04-25 |
