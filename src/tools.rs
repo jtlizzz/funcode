@@ -143,6 +143,17 @@ impl ToolRegistry {
         Self::default()
     }
 
+    /// 创建包含所有内置工具的注册中心。
+    pub fn with_default_tools() -> Self {
+        let mut registry = Self::new();
+        registry.register(Box::new(BashTool::new()));
+        registry.register(Box::new(FileReadTool::new()));
+        registry.register(Box::new(FileEditTool::new()));
+        registry.register(Box::new(FileWriteTool::new()));
+        registry.register(Box::new(GlobTool::new()));
+        registry
+    }
+
     /// 注册一个工具，如果同名工具已存在则覆盖。
     pub fn register(&mut self, tool: Box<dyn Tool>) {
         self.tools.insert(tool.name().to_string(), tool);

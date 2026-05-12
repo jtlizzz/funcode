@@ -14,4 +14,4 @@ pub use model::{
     Item, Message, Model, ModelError, ModelRequest, OpenAIProvider, TokenUsage, ToolSpec,
 };
 pub use session::Session;
-pub use tools::{Tool, ToolContext, ToolRegistry};
+pub use tools::{BashTool, FileReadTool, Tool, ToolContext, ToolRegistry};

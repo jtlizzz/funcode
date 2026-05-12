@@ -420,12 +420,12 @@ pub enum Message {
 ## 参考实现
 
 - Claude Code
-  - `参考: /home/acer/project/node_project/claude-code/src/services/api/claude.ts`
-  - `参考: /home/acer/project/node_project/claude-code/src/utils/messages.ts`
+  - `参考: /home/acer/project/claude-code/src/services/api/claude.ts`
+  - `参考: /home/acer/project/claude-code/src/utils/messages.ts`
 - Codex CLI
-  - `参考: /home/acer/project/rust_project/codex-main/codex-rs/protocol/src/models.rs`
-  - `参考: /home/acer/project/rust_project/codex-main/codex-rs/core/src/tools/router.rs`
+  - `参考: /home/acer/project/codex/codex-rs/protocol/src/models.rs`
+  - `参考: /home/acer/project/codex/codex-rs/core/src/tools/router.rs`
 - OpenCode
-  - `参考: /home/acer/project/node_project/opencode/packages/opencode/src/session/message-v2.ts`
-  - `参考: /home/acer/project/node_project/opencode/packages/opencode/src/session/processor.ts`
-  - `参考: /home/acer/project/node_project/opencode/packages/opencode/src/provider/transform.ts`
+  - `参考: /home/acer/project/opencode/packages/opencode/src/session/message-v2.ts`
+  - `参考: /home/acer/project/opencode/packages/opencode/src/session/processor.ts`
+  - `参考: /home/acer/project/opencode/packages/opencode/src/provider/transform.ts`

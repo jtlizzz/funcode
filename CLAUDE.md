@@ -26,9 +26,10 @@ Bus (infrastructure)  → Event broadcasting, connects Agent and UI
 
 | Project | Language | Local Path | Core Directory |
 |---------|----------|------------|----------------|
-| Claude Code | TypeScript | `/home/acer/project/node_project/claude-code` | `src/` |
-| Codex CLI | Rust | `/home/acer/project/rust_project/codex-main` | `codex-rs/` |
-| OpenCode | TypeScript | `/home/acer/project/node_project/opencode` | `packages/opencode/src/` |
+| Claude Code | TypeScript | `/home/acer/project/claude-code` | `src/` |
+| Codex CLI | Rust | `/home/acer/project/codex` | `codex-rs/` |
+| DeepSeek-TUI | Rust | `/home/acer/project/DeepSeek-TUI` | `crates/` |
+| OpenCode | TypeScript | `/home/acer/project/opencode` | `packages/opencode/src/` |
 
 ## Project Documentation
 

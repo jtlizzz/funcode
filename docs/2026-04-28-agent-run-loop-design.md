@@ -2,7 +2,7 @@
 
 > 日期: 2026-04-28
 > 分支: feat-run-loop
-> 状态: **倾向方案 B'：Codex-lite / Arc<Session> / spawned turn task**
+> 状态: **已实施：方案 C — spawned Agent + shared CancellationToken**
 
 ## 问题
 
@@ -11,7 +11,7 @@
 1. `run_turn` 执行期间（模型生成、工具调用）无法接收新的 `Op`
 2. `Op::Interrupt` 无法及时处理
 
-核心矛盾：**把“外部可控制的运行中实例”和“独占业务状态的执行器”混在了同一个 `Agent` 对象里**。
+核心矛盾：**把”外部可控制的运行中实例”和”独占业务状态的执行器”混在了同一个 `Agent` 对象里**。
 
 如果 `Agent::submit(&mut self, op)` 在同一个调用栈里 `await run_turn(&mut self)`，那么 `run_turn`
 期间外部无法再拿到同一个 `Agent` 的可变引用来提交 `Interrupt`。这不是单纯的 Rust 限制，而是
@@ -45,153 +45,119 @@
 
 ### 共同点
 
-共同点不是“取消信号都不走队列”，而是：
-
 1. **控制面不能被 turn 执行阻塞**
-   - Codex: `submission_loop` 继续消费 `Op::Interrupt`
-   - Claude: control request 入队，同时直接 abort 当前 controller
 2. **每个 turn 都有独立取消句柄**
-   - Codex: `ActiveTurn` 持有 per-turn `CancellationToken`
-   - Claude: 当前 turn 持有 `AbortController`
-3. **队列里的 Interrupt 负责状态收敛，取消句柄负责即时打断**
-   - Codex 的取消句柄由 `submission_loop` 收到 `Interrupt` 后触发
-   - Claude 的取消句柄可被外部控制路径直接触发
+3. **取消句柄负责即时打断，不经过消息队列排队**
 
-因此 funcode 不应该继续用可重置的 `watch<bool>` 模拟 per-turn cancel。更自然的模型是：
-`Interrupt` 回到 `Op`，当前 turn 的 `CancellationToken` 保存在 `ActiveTurn`，由主循环收到
-`Interrupt` 后触发。
+## 历史方案回顾
 
-## funcode 的讨论方向
-
-### 方案 A: 消息队列 + 独立取消通道（已实施，用户不满意）
+### 方案 A: 消息队列 + watch 取消通道（已废弃）
 
 ```
 调用方 -> AgentSender.submit(op) -> mpsc channel -> Agent.run() 顺序消费
 调用方 -> AgentSender.cancel()   -> watch channel -> run_turn 内 select! 感知
 ```
 
-- `Op` 枚举只保留 `UserTurn`（排队操作）
-- 取消走 `watch::channel(false)`，每轮 turn 重置
-- `run(&mut self)` 循环消费队列，每轮创建新 `CancellationToken`
-- **优点**: `&mut self` 就够，不需要 `Arc<Mutex<...>>`
-- **缺点**:
-  - 调用方需要持有额外的 `AgentSender`
-  - `watch<bool>` 需要每轮 reset，存在 stale value / race condition 风险
-  - `CancellationToken` 本身是 per-turn 对象，不适合被一个可重置 bool 信号间接驱动
-  - `run_turn` 同时承担模型循环和取消桥接，职责不够清晰
+- `watch<bool>` 每轮 reset，存在 stale value / race condition 风险
+- `AgentSender` 是额外的类型，调用方需要多持有一个东西
 
 ### 方案 B: 粗粒度 Arc 共享状态（不推荐）
 
-- 直接把整个 Agent 或 Session 包成 `Arc<Mutex<...>>`
-- `Interrupt` 放回 `Op` 枚举
-- `submission_loop` 不阻塞在 `run_turn` 上
-- **优点**: 最容易实现 spawned turn task
-- **缺点**:
-  - 容易变成 `Arc<Mutex<Agent>>`，把编排、会话历史、模型调用、工具执行锁成一坨
-  - 容易持锁跨 `.await`
-  - 领域边界不清晰，后续扩展 approval / tool / realtime 时会放大复杂度
+- `Arc<Mutex<Agent>>` 把编排、会话、模型调用、工具执行锁成一坨
+- 容易持锁跨 `.await`
 
-### 方案 B': Codex-lite（推荐）
+### 方案 B': Codex-lite（部分采纳）
 
-采用 Codex 的生命周期模型，但保持 funcode 的领域边界：
+- `Arc<Session>` + 内部细粒度锁 + spawned turn task
+- 完整实施需要大量重构 Session，当前阶段过重
+
+## 当前实施方案：方案 C — spawned Agent + shared CancellationToken
+
+借鉴 Claude Code 的双路径取消思路（取消不走队列、直接触发），但保持 funcode 的简单结构：
+Agent 整体 `spawn` 进后台 task，独占所有业务状态（`&mut self`），外部通过 `AgentHandle` 控制。
+
+### 架构
 
 ```
-Agent(handle)
-  ├─ tx_sub: mpsc::Sender<Submission>
+外部调用方
+  │
+  ├─ AgentHandle::user_turn(text)  ──> mpsc::Sender<Op> ──> run_op_loop
+  ├─ AgentHandle::interrupt()      ──> Arc<Mutex<CancellationToken>>.cancel() （直接触发）
+  ├─ AgentHandle::shutdown()       ──> mpsc::Sender<Op::Shutdown> ──> run_op_loop
+  └─ AgentHandle::subscribe()      ──> Bus::subscribe()
+
+Agent（owned by spawned task, 独占 &mut self）
+  ├─ model: Model
+  ├─ session: Session
+  ├─ registry: ToolRegistry
   ├─ bus: Bus
-  ├─ session: Arc<Session>
-  └─ loop_done: Shared<BoxFuture<'static, ()>>
+  ├─ cancel: Arc<Mutex<CancellationToken>>    ← 与 Handle 共享
+  └─ max_turns: usize
 
-submission_loop(rx_sub, Arc<Session>, Model, ToolRegistry, Bus)
-  ├─ Op::UserTurn(text) -> spawn turn task
-  ├─ Op::Interrupt      -> session.abort_active_turn(Interrupted)
-  └─ Op::Shutdown       -> abort active turn, cleanup, break
+run_op_loop(rx) {
+    while let Some(op) = rx.recv().await {
+        match op {
+            Op::UserTurn(text) => { session.push(user); self.run_turn().await; }
+            Op::Shutdown => { cancel_current_turn(); break; }
+        }
+    }
+}
 
-Session(domain object)
-  ├─ state: Mutex<SessionState>
-  └─ active_turn: Mutex<Option<ActiveTurn>>
-```
-
-关键点：
-
-- 外部 `Agent` 是简单 handle，不再是独占执行器
-- `Session` 是领域对象，内部自行管理锁，不向外暴露 `MutexGuard`
-- `run_turn` 作为后台 task 运行，`submission_loop` 不会被模型流或工具调用阻塞
-- `Interrupt` 回到 `Op`，调用方 API 统一
-- cancel 使用 per-turn `CancellationToken`，不 reset、不复用
-- 同一 session 同时最多一个 active turn；新 `UserTurn` 会 replace 当前 turn
-
-外部 API 目标：
-
-```rust
-let agent = Agent::spawn(model, session, registry, bus, max_turns).await?;
-agent.submit(Op::UserTurn("hello".into())).await?;
-agent.interrupt().await?;
-agent.shutdown_and_wait().await?;
-```
-
-内部 `Session` 方法示例：
-
-```rust
-impl Session {
-    async fn start_turn(&self, active: ActiveTurn);
-    async fn abort_active_turn(&self, reason: TurnAbortReason);
-    async fn build_request(&self, tools: &[ToolSpec]) -> ModelRequest;
-    async fn record_item(&self, item: Item);
-    async fn record_usage(&self, usage: TokenUsage);
+run_turn() {
+    self.reset_cancel();   // 每轮替换为全新 CancellationToken
+    for turn in 0..max_turns {
+        stream = model.stream(request, self.cancel());
+        // stream 内部用 tokio::select! 同时监听 cancel.cancelled() 和 SSE
+    }
 }
 ```
 
-锁使用规则：
+### 关键设计决策
 
-1. 不持有 `SessionState` 锁跨模型请求、工具执行、事件等待
-2. `Session` 暴露领域方法，不暴露内部锁
-3. `run_turn` 每次只短暂锁 session：构造 request、记录 item、记录 usage
-4. turn 完成写回时校验 `turn_id`，防止旧 turn 被 interrupt/replaced 后晚到写入
-5. `CancellationToken` 永远 per-turn 创建，不 reset、不复用
+1. **Agent 整体 spawn，不拆分 Session**
+   - `run_op_loop` 持有 `Agent` 的全部所有权，所有状态修改通过 `&mut self`
+   - 不需要 `Arc<Session>` 或内部锁，保持领域对象的简单性
+   - 代价：`run_op_loop` 在 `run_turn()` 期间阻塞在同一个 task 里，无法同时消费新 Op
 
-## 已完成的代码改动（feat-run-loop 分支）
+2. **取消走独立路径，不经消息队列**
+   - `AgentHandle::interrupt()` 直接操作 `Arc<Mutex<CancellationToken>>`
+   - 即使 `run_op_loop` 正在 `await run_turn()`，取消也能立即生效
+   - `CancellationToken` 在 `run_turn()` 开头通过 `reset_cancel()` 替换为全新实例
+   - 前一轮的取消不会泄漏到后续 turn
 
-以下是**已实施但用户不满意**的方案 A 的改动，可 `git diff` 查看：
+3. **`Op` 枚举只保留 `UserTurn` 和 `Shutdown`**
+   - `Interrupt` 不在 `Op` 里，因为队列阻塞时无法及时处理
+   - 这与 Claude Code 的双路径模型一致：abort 直接触发，不走 FIFO
 
-### 改动文件: `src/agent.rs`
+4. **`Session` 保持纯同步领域对象**
+   - `push()` / `build_request()` / `record_usage()` 都是 `&mut self`
+   - 不引入内部可变性，不需要运行时锁
+   - 当需要拆分 turn task 时再引入 `Arc<Session>`
 
-1. `Op` 枚举移除 `Interrupt`，只保留 `UserTurn`
-2. 新增 `AgentSender` 结构体（`op_tx` + `cancel_tx: watch::Sender<bool>` + `bus`）
-3. `Agent::new` 返回 `(Self, AgentSender)`
-4. 新增 `Agent::run(mut self) -> Self` 主循环
-5. 删除 `Agent::submit`
-6. `run_turn` 内部：
-   - 每轮重置 `watch::send(false)` + 创建新 `CancellationToken`
-   - 流式消费循环用 `tokio::select!` 同时监听 `stream.next()` 和 `cancel_rx.changed()`
-7. 测试全部适配（9 个测试通过）
+### 与方案 B' 的关系
 
-### 用户不满意的原因
+方案 C 是 B' 的简化过渡：
 
-- `AgentSender` 是额外的类型，调用方需要多持有一个东西
-- watch 重置有时序问题（stale permit / race condition）
-- 整体感觉过度工程，不够简洁
+- 相同点：外部 handle + 后台 loop + per-turn CancellationToken + Bus 事件
+- 不同点：Agent 整体 spawn（而非拆分 Session 为 Arc）、`run_op_loop` 串行消费（而非 spawned turn task）
+- 方案 C 的 `reset_cancel()` 用 `Arc<Mutex<CancellationToken>>` 的原地替换替代了 B' 的 per-turn token
+- 当出现并发 turn 需求（如 sub-agent）时，再向 B' 演进
 
-## 关键约束
+### 外部 API
 
-1. 对外接口保持简单：调用方只持有 `Agent`
-2. cancel 只取消当前 turn，不影响后续 turn
-3. 内部可以使用 `Arc` / `Mutex`，但要保持领域边界清晰
-4. 不使用可 reset 的 `watch<bool>` 表达 per-turn cancel
-5. `CancellationToken` 一旦 cancel 就不能 un-cancel，因此必须 per-turn 创建
-6. `submission_loop` 不能阻塞在 `run_turn` 上，否则 `Interrupt` 仍然无法及时处理
+```rust
+let handle = Agent::spawn(agent, 16);
 
-## 结论
+handle.user_turn(“hello”.to_string()).await?;  // 提交用户输入
+handle.interrupt().await?;                      // 立即取消当前 turn
+handle.shutdown().await?;                       // 关闭后台 loop
 
-方案 A 解决了 interrupt 即时性，但 API 和取消语义都不理想。
+let mut sub = handle.subscribe();               // 订阅事件流
+```
 
-下一步应转向方案 B'：
+### 取消语义保证
 
-- `Agent` 改为运行中实例的 handle
-- `Op::Interrupt` 放回统一 `Op`
-- `Session` 改为 `Arc<Session>` + 内部细粒度锁
-- active turn 显式建模为 `ActiveTurn`
-- turn task spawned，`submission_loop` 只负责调度和生命周期管理
-
-这不是简单照搬 Codex，而是保留 funcode 的 Domain-Driven 边界：`Session` 仍然拥有历史和 token
-预算逻辑，`Agent` 只负责编排生命周期，`Model` 只负责响应生成，`ToolRegistry` 只负责工具执行。
+1. `interrupt()` 调用后，正在进行的 `model.stream()` 内部 `tokio::select!` 立即感知取消
+2. `run_turn()` 收到 `Cancelled` 后发出 `Event::TurnInterrupted`，不 push 任何 assistant item
+3. `reset_cancel()` 在下一次 `run_turn()` 开头执行，确保取消不泄漏
+4. `shutdown()` 先 cancel 当前 turn，再退出 loop

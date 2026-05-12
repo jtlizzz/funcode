@@ -16,3 +16,6 @@ ignore = "0.4"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "time", "sync"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 dotenv = "0.15"
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+tokio-stream = "0.1"
