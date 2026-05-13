@@ -2,7 +2,7 @@
 
 # funcode
 
-**A terminal AI coding assistant written in Rust**
+**Rust 编写的终端 AI 编程助手**
 
 [![Rust](https://img.shields.io/badge/rust-1.95-orange?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Version](https://img.shields.io/badge/version-0.1.0-blue)](https://github.com/user/funcode)
@@ -11,7 +11,7 @@
 
 </div>
 
-**English** | [中文](README.zh-CN.md)
+[English](README.md) | **中文**
 
-funcode is a terminal-based AI programming assistant that runs in your codebase. It understands your project, reads and modifies files, executes commands, and collaborates with you to complete coding tasks — all from the terminal.
+一个运行在代码仓库中的终端 AI 编程助手。它能理解项目结构、读写文件、执行命令，在终端里与你协作完成编码任务。
 
