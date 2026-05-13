@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use funcode::{Agent, BashTool, Bus, Event, Model, OpenAIProvider, ReceiveResult, Session, ToolRegistry};
+use funcode::{Agent, BashTool, Event, Model, OpenAIProvider, Session, ToolRegistry};
 
 #[tokio::test]
 #[ignore] // Run with: cargo test --test integration_openai -- --ignored
@@ -42,14 +42,11 @@ async fn test_openai_real_flow() {
     // Build empty tool registry (no tools for this test)
     let registry = ToolRegistry::new();
 
-    // Build agent
-    let agent = Agent::new(model, session, registry, Bus::new(64), 10);
+    // Build agent and spawn
+    let handle = Agent::spawn(model, session, registry, 10, 16);
 
-    // Spawn agent with handle
-    let handle = agent.spawn(16);
-    let mut subscriber = handle.subscribe();
-
-    // Subscribe to events in background
+    // Collect events in background
+    let event_handle = handle.clone();
     let event_task = tokio::spawn(async move {
         let mut text_output = String::new();
         let mut turn_complete = false;
@@ -57,14 +54,14 @@ async fn test_openai_real_flow() {
             // Exit if turn completed and no more events pending
             if turn_complete {
                 // Small timeout to catch any remaining events
-                match tokio::time::timeout(Duration::from_millis(100), subscriber.recv()).await {
+                match tokio::time::timeout(Duration::from_millis(100), event_handle.recv_event()).await {
                     Ok(Some(_)) => continue, // Process remaining event
                     _ => break,               // Timeout or closed -> exit
                 }
             }
 
-            match subscriber.recv().await {
-                Some(ReceiveResult::Event(event)) => {
+            match event_handle.recv_event().await {
+                Some(event) => {
                     match &event {
                         Event::TurnStarted => {
                             print!("\n[Turn started]\n> ");
@@ -99,10 +96,6 @@ async fn test_openai_real_flow() {
                             // Other events not printed in this simple test
                         }
                     }
-                }
-                Some(ReceiveResult::Lagged(n)) => {
-                    println!("\n[Lagged: {} events dropped]", n);
-                    break;
                 }
                 None => {
                     println!("\n[Channel closed]");
@@ -174,12 +167,8 @@ async fn test_openai_tool_use() {
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(BashTool::new()));
 
-    // Build agent
-    let agent = Agent::new(model, session, registry, Bus::new(64), 10);
-
-    // Spawn agent with handle
-    let handle = agent.spawn(16);
-    let mut subscriber = handle.subscribe();
+    // Build agent and spawn
+    let handle = Agent::spawn(model, session, registry, 10, 16);
 
     // Track tool execution
     let tool_call_start = std::sync::Arc::new(std::sync::Mutex::new(false));
@@ -187,6 +176,7 @@ async fn test_openai_tool_use() {
     let tool_output = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
 
     // Subscribe to events in background
+    let event_handle = handle.clone();
     let event_task = tokio::spawn({
         let tool_call_start = tool_call_start.clone();
         let tool_call_end = tool_call_end.clone();
@@ -197,14 +187,14 @@ async fn test_openai_tool_use() {
             loop {
                 // Exit if turn completed
                 if turn_complete {
-                    match tokio::time::timeout(Duration::from_millis(100), subscriber.recv()).await {
+                    match tokio::time::timeout(Duration::from_millis(100), event_handle.recv_event()).await {
                         Ok(Some(_)) => continue,
                         _ => break,
                     }
                 }
 
-                match subscriber.recv().await {
-                    Some(ReceiveResult::Event(event)) => {
+                match event_handle.recv_event().await {
+                    Some(event) => {
                         match &event {
                             Event::TurnStarted => {
                                 println!("\n[Turn started]");
@@ -252,10 +242,6 @@ async fn test_openai_tool_use() {
                             }
                             _ => {}
                         }
-                    }
-                    Some(ReceiveResult::Lagged(n)) => {
-                        println!("\n[Lagged: {} events dropped]", n);
-                        break;
                     }
                     None => {
                         println!("\n[Channel closed]");

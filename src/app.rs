@@ -1,7 +1,6 @@
 //! Application assembly and lifecycle management.
 
 use crate::agent::Agent;
-use crate::bus::Bus;
 use crate::config;
 use crate::model::{Model, OpenAIProvider};
 use crate::session::Session;
@@ -20,16 +19,14 @@ pub enum AppError {
 
 pub async fn run() -> Result<(), AppError> {
     let cfg = config::load()?;
-
+    //todo: anthropic provider
     let provider = OpenAIProvider::new(cfg.api_key, Some(cfg.base_url))?;
     let model = Model::new(Box::new(provider), &cfg.model)?;
     let session = Session::new("You are a helpful coding assistant.", 100_000);
     let registry = ToolRegistry::with_default_tools();
 
-    let bus = Bus::new(256);
-    let agent = Agent::new(model, session, registry, bus, 20);
+    let handle = Agent::spawn(model, session, registry, 20, 16);
     let model_name = cfg.model.clone();
-    let handle = agent.spawn(16);
 
     tui::run_tui(handle, model_name).await.map_err(AppError::Terminal)
 }

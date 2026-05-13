@@ -1,7 +1,7 @@
 mod agent;
 mod app;
 mod approval;
-mod bus;
+mod event;
 mod config;
 mod context;
 mod fs;

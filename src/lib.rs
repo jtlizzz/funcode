@@ -2,14 +2,14 @@
 
 pub mod agent;
 pub mod approval;
-pub mod bus;
+pub mod event;
 pub mod model;
 pub mod session;
 pub mod tools;
 
 // Re-export commonly used types at crate root
 pub use agent::{Agent, AgentHandle, Op, TurnOutcome};
-pub use bus::{Bus, Event, ReceiveResult, Subscriber};
+pub use event::Event;
 pub use model::{
     Item, Message, Model, ModelError, ModelRequest, OpenAIProvider, TokenUsage, ToolSpec,
 };

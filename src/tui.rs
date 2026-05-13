@@ -12,7 +12,7 @@ use ratatui::Terminal;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::agent::AgentHandle;
-use crate::bus::{Event, ReceiveResult};
+use crate::event::Event;
 
 // === AppEvent ===
 
@@ -279,37 +279,23 @@ fn handle_agent_event(event: Event, state: &mut DisplayState) {
 pub async fn run_tui(handle: AgentHandle, model_name: String) -> Result<(), Box<dyn std::error::Error>> {
     let mut guard = TuiGuard::init()?;
     let mut state = DisplayState::new(model_name);
-    let mut subscriber = handle.subscribe();
 
     let crossterm_stream = EventStream::new();
 
-    // Wrap subscriber into a stream for tokio::select!
+    // Merge agent and crossterm events into one stream
     let (agent_tx, agent_rx) = tokio::sync::mpsc::channel::<AppEvent>(64);
     let agent_rx_stream = ReceiverStream::new(agent_rx);
 
     // Spawn a task to forward agent events
     let agent_forward_tx = agent_tx.clone();
+    let event_handle = handle.clone();
     tokio::spawn(async move {
-        loop {
-            match subscriber.recv().await {
-                Some(ReceiveResult::Event(event)) => {
-                    if agent_forward_tx.send(AppEvent::AgentEvent(event)).await.is_err() {
-                        break;
-                    }
-                }
-                Some(ReceiveResult::Lagged(n)) => {
-                    let _ = agent_forward_tx
-                        .send(AppEvent::AgentEvent(Event::Error(format!(
-                            "lagged {n} events"
-                        ))))
-                        .await;
-                }
-                None => {
-                    let _ = agent_forward_tx.send(AppEvent::AgentGone).await;
-                    break;
-                }
+        while let Some(event) = event_handle.recv_event().await {
+            if agent_forward_tx.send(AppEvent::AgentEvent(event)).await.is_err() {
+                break;
             }
         }
+        let _ = agent_forward_tx.send(AppEvent::AgentGone).await;
     });
 
     // Also forward crossterm events

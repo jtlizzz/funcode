@@ -31,9 +31,9 @@ use futures_util::StreamExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::bus::{Bus, Event};
+use crate::event::Event;
 use crate::model::{
-    Item, Message, Model, ModelError, ResponseEvent, ResponseStream, TokenUsage, ToolCall,
+    Item, Model, ModelError, ResponseEvent, TokenUsage, ToolCall,
     ToolResult,
 };
 use crate::session::Session;
@@ -75,12 +75,14 @@ type SharedCancelToken = Arc<Mutex<CancellationToken>>;
 
 /// Agent handle held by external callers.
 ///
-/// Normal user turns enter the Agent background loop through the queue. Cancellation uses the
-/// shared `CancellationToken` path so a running turn cannot block interrupt requests.
+/// Wraps both communication channels: `op_tx` for sending operations to the Agent,
+/// and `event_rx` for receiving observation events. Clone-able via `Arc<Mutex<Receiver>>`.
+///
+/// Reference: DeepSeek-TUI `EngineHandle` — same pattern.
 #[derive(Clone)]
 pub struct AgentHandle {
-    tx: mpsc::Sender<Op>,
-    bus: Bus,
+    op_tx: mpsc::Sender<Op>,
+    event_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<Event>>>,
     cancel: SharedCancelToken,
 }
 
@@ -91,28 +93,22 @@ pub enum AgentHandleError {
 }
 
 impl AgentHandle {
-    /// Subscribe to Agent observation events.
-    pub fn subscribe(&self) -> crate::bus::Subscriber {
-        self.bus.subscribe()
+    /// Receive the next agent event.
+    pub async fn recv_event(&self) -> Option<Event> {
+        self.event_rx.lock().await.recv().await
     }
 
     /// Submit one user input turn.
-    ///
-    /// Completion, interrupt, and error states are observed through [`Bus`] events.
     pub async fn user_turn(&self, text: String) -> Result<(), AgentHandleError> {
-        self.tx
+        self.op_tx
             .send(Op::UserTurn(text))
             .await
             .map_err(|_| AgentHandleError::Closed)
     }
 
     /// Immediately cancel the current turn.
-    ///
-    /// This does not enqueue an op. It directly triggers the current turn token. The Agent
-    /// replaces the token at the start of the next turn, so cancellation does not leak into
-    /// later turns.
     pub async fn interrupt(&self) -> Result<(), AgentHandleError> {
-        if self.tx.is_closed() {
+        if self.op_tx.is_closed() {
             return Err(AgentHandleError::Closed);
         }
 
@@ -126,7 +122,7 @@ impl AgentHandle {
 
     /// Request shutdown of the Agent background loop.
     pub async fn shutdown(&self) -> Result<(), AgentHandleError> {
-        self.tx
+        self.op_tx
             .send(Op::Shutdown)
             .await
             .map_err(|_| AgentHandleError::Closed)
@@ -135,12 +131,12 @@ impl AgentHandle {
 
 // ==================== Agent ====================
 
-/// Core Agent object that connects Model / Session / ToolRegistry / Bus.
+/// Core Agent object that connects Model / Session / ToolRegistry.
 pub struct Agent {
     model: Model,
     session: Session,
     registry: ToolRegistry,
-    bus: Bus,
+    event_tx: mpsc::Sender<Event>,
     max_turns: usize,
     /// Current turn cancellation handle. `AgentHandle::interrupt()` uses it as an independent
     /// cancellation path.
@@ -148,35 +144,13 @@ pub struct Agent {
 }
 
 impl Agent {
-    /// Create a new Agent.
-    ///
-    /// `max_turns` is the maximum loop count allowed for one `submit` call, preventing infinite
-    /// loops. Reference: Claude Code `query.ts`'s `maxTurns` parameter.
-    pub fn new(
-        model: Model,
-        session: Session,
-        registry: ToolRegistry,
-        bus: Bus,
-        max_turns: usize,
-    ) -> Self {
-        let cancel = Arc::new(Mutex::new(CancellationToken::new()));
-        Self {
-            model,
-            session,
-            registry,
-            bus,
-            max_turns,
-            cancel,
-        }
-    }
-
-    /// Return a read-only event bus reference for external `subscribe` calls.
-    pub fn bus(&self) -> &Bus {
-        &self.bus
+    /// Emit an event.
+    fn emit(&self, event: Event) {
+        let _ = self.event_tx.try_send(event);
     }
 
     /// Return a read-only session reference.
-    pub fn session(&self) -> &Session {
+    fn session(&self) -> &Session {
         &self.session
     }
 
@@ -184,7 +158,7 @@ impl Agent {
     ///
     /// This is the single direct-call entry point for Agent operations:
     /// - `Op::user_turn(text)` -> start one conversation turn
-    pub async fn submit(&mut self, op: Op) -> TurnOutcome {
+    async fn submit(&mut self, op: Op) -> TurnOutcome {
         match op {
             Op::UserTurn(text) => {
                 self.session.push(Item::user(text));
@@ -194,17 +168,41 @@ impl Agent {
         }
     }
 
-    /// Start the Agent background loop and return a cloneable external control handle.
-    pub fn spawn(self, queue_capacity: usize) -> AgentHandle {
-        let bus = self.bus.clone();
-        let cancel = self.cancel.clone();
-        let (tx, rx) = mpsc::channel(queue_capacity);
+    /// Create an Agent and start its background loop, returning a cloneable control handle.
+    ///
+    /// This is the only public constructor. Creates both communication channels internally:
+    /// op channel for sending operations, event channel for receiving observation events.
+    ///
+    /// Reference: DeepSeek-TUI `spawn_engine()` — same pattern.
+    pub fn spawn(
+        model: Model,
+        session: Session,
+        registry: ToolRegistry,
+        max_turns: usize,
+        queue_capacity: usize,
+    ) -> AgentHandle {
+        let (op_tx, op_rx) = mpsc::channel(queue_capacity);
+        let (event_tx, event_rx) = mpsc::channel(256);
+        let cancel = Arc::new(Mutex::new(CancellationToken::new()));
+
+        let agent = Self {
+            model,
+            session,
+            registry,
+            event_tx,
+            max_turns,
+            cancel: cancel.clone(),
+        };
 
         tokio::spawn(async move {
-            self.run_op_loop(rx).await;
+            agent.run_op_loop(op_rx).await;
         });
 
-        AgentHandle { tx, bus, cancel }
+        AgentHandle {
+            op_tx,
+            event_rx: Arc::new(tokio::sync::Mutex::new(event_rx)),
+            cancel,
+        }
     }
 
     async fn run_op_loop(mut self, mut rx: mpsc::Receiver<Op>) {
@@ -270,12 +268,12 @@ impl Agent {
         // Reset cancellation: each new turn gets a fresh token.
         self.reset_cancel();
 
-        self.bus.publish(Event::TurnStarted);
+        self.emit(Event::TurnStarted);
 
         for turn in 0..self.max_turns {
             // Check for interruption.
             if self.is_cancelled() {
-                self.bus.publish(Event::TurnInterrupted);
+                self.emit(Event::TurnInterrupted);
                 return TurnOutcome::Interrupted;
             }
 
@@ -291,7 +289,7 @@ impl Agent {
             let mut stream = match self.model.stream(request, cancel).await {
                 Ok(s) => s,
                 Err(err) => {
-                    self.bus.publish(Event::Error(err.to_string()));
+                    self.emit(Event::Error(err.to_string()));
                     return TurnOutcome::Failed(err.to_string());
                 }
             };
@@ -303,24 +301,24 @@ impl Agent {
                 let result = match stream.next().await {
                     Some(Ok(event)) => event,
                     Some(Err(err)) => {
-                        self.bus.publish(Event::Error(err.to_string()));
+                        self.emit(Event::Error(err.to_string()));
                         return TurnOutcome::Failed(err.to_string());
                     }
                     None => {
                         let error =
                             ModelError::StreamProtocol("stream ended without Completed event")
                                 .to_string();
-                        self.bus.publish(Event::Error(error.clone()));
+                        self.emit(Event::Error(error.clone()));
                         return TurnOutcome::Failed(error);
                     }
                 };
 
                 match result {
                     ResponseEvent::TextDelta(delta) => {
-                        self.bus.publish(Event::TextDelta(delta));
+                        self.emit(Event::TextDelta(delta));
                     }
                     ResponseEvent::ToolCallStart { id, name } => {
-                        self.bus.publish(Event::ToolCallBegin {
+                        self.emit(Event::ToolCallBegin {
                             id: id.clone(),
                             name: name.clone(),
                         });
@@ -335,12 +333,12 @@ impl Agent {
                         tool_calls.push(call);
                     }
                     ResponseEvent::Cancelled => {
-                        self.bus.publish(Event::TurnInterrupted);
+                        self.emit(Event::TurnInterrupted);
                         return TurnOutcome::Interrupted;
                     }
                     ResponseEvent::TextDone(text) => {
                         self.session.push(Item::assistant(text.clone()));
-                        self.bus.publish(Event::TextDone(text));
+                        self.emit(Event::TextDone(text));
                     }
                     ResponseEvent::Completed {
                         usage,
@@ -359,7 +357,7 @@ impl Agent {
             if tool_calls.is_empty() {
                 // No tool calls means the turn completed normally.
                 let final_usage = usage;
-                self.bus.publish(Event::TurnComplete { usage: final_usage });
+                self.emit(Event::TurnComplete { usage: final_usage });
                 return TurnOutcome::Completed { usage: final_usage };
             }
 
@@ -377,7 +375,7 @@ impl Agent {
 
         // Exceeded max_turns.
         let error = format!("max turns reached ({})", self.max_turns);
-        self.bus.publish(Event::Error(error));
+        self.emit(Event::Error(error));
         TurnOutcome::MaxTurnsReached {
             max_turns: self.max_turns,
         }
@@ -407,7 +405,7 @@ impl Agent {
                 )
                 .await;
 
-            self.bus.publish(Event::ToolCallEnd {
+            self.emit(Event::ToolCallEnd {
                 id: call.id.clone(),
                 name: call.name.clone(),
                 output: result.content.clone(),
@@ -426,7 +424,7 @@ impl Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ModelError, ModelProvider, ModelRequest, ModelResponse};
+    use crate::model::{Message, ModelError, ModelProvider, ModelRequest, ModelResponse, ResponseStream};
     use crate::tools::Tool;
     use async_trait::async_trait;
     use serde_json::json;
@@ -681,7 +679,7 @@ mod tests {
 
     // === Helpers ===
 
-    fn text_agent(response: &str) -> Agent {
+    fn text_agent(response: &str) -> (Agent, mpsc::Receiver<Event>) {
         let model = Model::new(
             Box::new(TextProvider {
                 response: response.to_string(),
@@ -691,8 +689,16 @@ mod tests {
         .unwrap();
         let session = Session::new("You are helpful.", 100_000);
         let registry = ToolRegistry::new();
-        let bus = Bus::new(64);
-        Agent::new(model, session, registry, bus, 10)
+        let (event_tx, event_rx) = mpsc::channel(64);
+        let agent = Agent {
+            model,
+            session,
+            registry,
+            event_tx,
+            max_turns: 10,
+            cancel: Arc::new(Mutex::new(CancellationToken::new())),
+        };
+        (agent, event_rx)
     }
 
     /// Echo tool for testing.
@@ -718,11 +724,22 @@ mod tests {
         }
     }
 
-    async fn collect_events(sub: &mut crate::bus::Subscriber, max: usize) -> Vec<Event> {
+    async fn collect_events(event_rx: &mut mpsc::Receiver<Event>, max: usize) -> Vec<Event> {
         let mut events = Vec::with_capacity(max);
         for _ in 0..max {
-            match tokio::time::timeout(std::time::Duration::from_millis(500), sub.recv()).await {
-                Ok(Some(crate::bus::ReceiveResult::Event(e))) => events.push(e),
+            match tokio::time::timeout(std::time::Duration::from_millis(500), event_rx.recv()).await {
+                Ok(Some(e)) => events.push(e),
+                _ => break,
+            }
+        }
+        events
+    }
+
+    async fn collect_handle_events(handle: &AgentHandle, max: usize) -> Vec<Event> {
+        let mut events = Vec::with_capacity(max);
+        for _ in 0..max {
+            match tokio::time::timeout(std::time::Duration::from_millis(500), handle.recv_event()).await {
+                Ok(Some(e)) => events.push(e),
                 _ => break,
             }
         }
@@ -733,13 +750,12 @@ mod tests {
 
     #[tokio::test]
     async fn text_only_turn_completes() {
-        let mut agent = text_agent("Hello world");
-        let mut sub = agent.bus().subscribe();
+        let (mut agent, mut event_rx) = text_agent("Hello world");
 
         agent.submit(Op::user_turn("hi")).await;
 
         // Expected events: TurnStarted -> TextDelta -> TextDone -> TurnComplete.
-        let events = collect_events(&mut sub, 4).await;
+        let events = collect_events(&mut event_rx, 4).await;
         assert!(events.contains(&Event::TurnStarted));
         assert!(events.contains(&Event::TextDelta("Hello world".to_string())));
         assert!(events.contains(&Event::TextDone("Hello world".to_string())));
@@ -752,16 +768,20 @@ mod tests {
 
     #[tokio::test]
     async fn agent_handle_user_turn_completes() {
-        let agent = text_agent("Hello from handle");
-        let handle = Agent::spawn(agent, 16);
-        let mut sub = handle.subscribe();
+        let handle = Agent::spawn(
+            Model::new(Box::new(TextProvider { response: "Hello from handle".to_string() }), "test-model").unwrap(),
+            Session::new("You are helpful.", 100_000),
+            ToolRegistry::new(),
+            10,
+            16,
+        );
 
         handle
             .user_turn("hi".to_string())
             .await
             .expect("handle should enqueue turn");
 
-        let events = collect_events(&mut sub, 4).await;
+        let events = collect_handle_events(&handle, 4).await;
         assert!(events.contains(&Event::TextDone("Hello from handle".to_string())));
         assert!(
             events
@@ -772,8 +792,13 @@ mod tests {
 
     #[tokio::test]
     async fn agent_handle_rejects_after_loop_closes() {
-        let agent = text_agent("bye");
-        let handle = Agent::spawn(agent, 1);
+        let handle = Agent::spawn(
+            Model::new(Box::new(TextProvider { response: "bye".to_string() }), "test-model").unwrap(),
+            Session::new("system", 100_000),
+            ToolRegistry::new(),
+            10,
+            1,
+        );
 
         handle.shutdown().await.expect("shutdown op should send");
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -788,20 +813,20 @@ mod tests {
 
     #[tokio::test]
     async fn handle_interrupt_cancels_running_turn() {
-        let model = Model::new(Box::new(BlockingUntilCancelProvider), "test-model").unwrap();
-        let session = Session::new("system", 100_000);
-        let registry = ToolRegistry::new();
-        let bus = Bus::new(64);
-        let agent = Agent::new(model, session, registry, bus, 10);
-        let handle = Agent::spawn(agent, 16);
-        let mut sub = handle.subscribe();
+        let handle = Agent::spawn(
+            Model::new(Box::new(BlockingUntilCancelProvider), "test-model").unwrap(),
+            Session::new("system", 100_000),
+            ToolRegistry::new(),
+            10,
+            16,
+        );
 
         let turn_handle = {
             let handle = handle.clone();
             tokio::spawn(async move { handle.user_turn("block".to_string()).await })
         };
 
-        let first_events = collect_events(&mut sub, 2).await;
+        let first_events = collect_handle_events(&handle, 2).await;
         assert!(first_events.contains(&Event::TurnStarted));
         assert!(first_events.contains(&Event::TextDelta("started".to_string())));
 
@@ -813,13 +838,13 @@ mod tests {
             .expect("task should join")
             .expect("turn should enqueue");
 
-        let events = collect_events(&mut sub, 2).await;
+        let events = collect_handle_events(&handle, 2).await;
         assert!(events.iter().any(|e| matches!(e, Event::TurnInterrupted)));
     }
 
     #[tokio::test]
     async fn cancel_token_works() {
-        let mut agent = text_agent("response");
+        let (mut agent, mut event_rx) = text_agent("response");
 
         // Cancellation starts unset.
         assert!(!agent.is_cancelled());
@@ -829,12 +854,11 @@ mod tests {
         assert!(agent.is_cancelled());
 
         // A normal submit resets the cancellation token and completes.
-        let mut sub = agent.bus().subscribe();
         agent.submit(Op::user_turn("hi")).await;
 
         // After reset, the turn should complete normally.
         assert!(!agent.is_cancelled());
-        let events = collect_events(&mut sub, 4).await;
+        let events = collect_events(&mut event_rx, 4).await;
         assert!(events.contains(&Event::TurnStarted));
         assert!(
             events
@@ -852,8 +876,15 @@ mod tests {
             r.register(Box::new(EchoTool));
             r
         };
-        let bus = Bus::new(64);
-        let mut agent = Agent::new(model, session, registry, bus, 2);
+        let (event_tx, _event_rx) = mpsc::channel(64);
+        let mut agent = Agent {
+            model,
+            session,
+            registry,
+            event_tx,
+            max_turns: 2,
+            cancel: Arc::new(Mutex::new(CancellationToken::new())),
+        };
 
         agent.submit(Op::user_turn("use tool")).await;
 
@@ -872,8 +903,15 @@ mod tests {
             r.register(Box::new(EchoTool));
             r
         };
-        let bus = Bus::new(64);
-        let mut agent = Agent::new(model, session, registry, bus, 1);
+        let (event_tx, _event_rx) = mpsc::channel(64);
+        let mut agent = Agent {
+            model,
+            session,
+            registry,
+            event_tx,
+            max_turns: 1,
+            cancel: Arc::new(Mutex::new(CancellationToken::new())),
+        };
 
         agent.submit(Op::user_turn("use echo")).await;
 
@@ -900,13 +938,19 @@ mod tests {
             r.register(Box::new(EchoTool));
             r
         };
-        let bus = Bus::new(64);
-        let mut agent = Agent::new(model, session, registry, bus, 1);
-        let mut sub = agent.bus().subscribe();
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let mut agent = Agent {
+            model,
+            session,
+            registry,
+            event_tx,
+            max_turns: 1,
+            cancel: Arc::new(Mutex::new(CancellationToken::new())),
+        };
 
         agent.submit(Op::user_turn("go")).await;
 
-        let events = collect_events(&mut sub, 5).await;
+        let events = collect_events(&mut event_rx, 5).await;
         assert!(events.contains(&Event::TurnStarted));
         assert!(events.contains(&Event::ToolCallBegin {
             id: "call_1".to_string(),
@@ -923,15 +967,21 @@ mod tests {
         let model = Model::new(Box::new(SlowProvider), "test-model").unwrap();
         let session = Session::new("system", 100_000);
         let registry = ToolRegistry::new();
-        let bus = Bus::new(64);
-        let mut agent = Agent::new(model, session, registry, bus, 10);
-        let mut sub = agent.bus().subscribe();
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let mut agent = Agent {
+            model,
+            session,
+            registry,
+            event_tx,
+            max_turns: 10,
+            cancel: Arc::new(Mutex::new(CancellationToken::new())),
+        };
 
         // SlowProvider sends one TextDelta and then cancels the token itself.
         // This simulates an interrupt during streaming output.
         agent.submit(Op::user_turn("test interrupt")).await;
 
-        let events = collect_events(&mut sub, 5).await;
+        let events = collect_events(&mut event_rx, 5).await;
 
         // Should receive TurnStarted and TurnInterrupted.
         assert!(events.contains(&Event::TurnStarted));
@@ -957,13 +1007,19 @@ mod tests {
         let model = Model::new(Box::new(MissingTerminalProvider), "test-model").unwrap();
         let session = Session::new("system", 100_000);
         let registry = ToolRegistry::new();
-        let bus = Bus::new(64);
-        let mut agent = Agent::new(model, session, registry, bus, 10);
-        let mut sub = agent.bus().subscribe();
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let mut agent = Agent {
+            model,
+            session,
+            registry,
+            event_tx,
+            max_turns: 10,
+            cancel: Arc::new(Mutex::new(CancellationToken::new())),
+        };
 
         agent.submit(Op::user_turn("test eof")).await;
 
-        let events = collect_events(&mut sub, 5).await;
+        let events = collect_events(&mut event_rx, 5).await;
         assert!(events.contains(&Event::TurnStarted));
         assert!(events
             .iter()
@@ -981,13 +1037,19 @@ mod tests {
         let model = Model::new(Box::new(LateCancelAfterDoneProvider), "test-model").unwrap();
         let session = Session::new("system", 100_000);
         let registry = ToolRegistry::new();
-        let bus = Bus::new(64);
-        let mut agent = Agent::new(model, session, registry, bus, 10);
-        let mut sub = agent.bus().subscribe();
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let mut agent = Agent {
+            model,
+            session,
+            registry,
+            event_tx,
+            max_turns: 10,
+            cancel: Arc::new(Mutex::new(CancellationToken::new())),
+        };
 
         agent.submit(Op::user_turn("test late cancel")).await;
 
-        let events = collect_events(&mut sub, 5).await;
+        let events = collect_events(&mut event_rx, 5).await;
         assert!(events.contains(&Event::TurnStarted));
         assert!(events.contains(&Event::TextDelta("done".to_string())));
         assert!(events.contains(&Event::TextDone("done".to_string())));
